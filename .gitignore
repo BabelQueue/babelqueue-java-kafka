@@ -1,2 +1,5 @@
 target/
 *.class
+
+# CommitBrief local config and cache
+.commitbrief/
