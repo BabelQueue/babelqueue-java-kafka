@@ -1,0 +1,42 @@
+name: Release
+
+on:
+  push:
+    tags: [ "v*" ]
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+          cache: maven
+          # Writes a settings.xml server entry `central` using the env vars below,
+          # and imports the GPG key for signing.
+          server-id: central
+          server-username: CENTRAL_TOKEN_USERNAME
+          server-password: CENTRAL_TOKEN_PASSWORD
+          gpg-private-key: ${{ secrets.GPG_PRIVATE_KEY }}
+          gpg-passphrase: MAVEN_GPG_PASSPHRASE
+
+      - name: Run tests
+        run: mvn -B --no-transfer-progress verify
+
+      - name: Publish to Maven Central
+        run: mvn -B --no-transfer-progress -Prelease -DskipTests deploy
+        env:
+          CENTRAL_TOKEN_USERNAME: ${{ secrets.CENTRAL_TOKEN_USERNAME }}
+          CENTRAL_TOKEN_PASSWORD: ${{ secrets.CENTRAL_TOKEN_PASSWORD }}
+          MAVEN_GPG_PASSPHRASE: ${{ secrets.GPG_PASSPHRASE }}
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          generate_release_notes: true

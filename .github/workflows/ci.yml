@@ -1,0 +1,44 @@
+name: CI
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        java: [ "17", "21" ]
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: ${{ matrix.java }}
+          cache: maven
+
+      # `verify` runs the JUnit 5 suite and the JaCoCo >=90% line-coverage gate. The Kafka
+      # Consumer interface is mocked with Mockito and the producer with the official
+      # MockProducer — no Kafka, no network.
+      - name: Test
+        run: mvn -B --no-transfer-progress verify
+
+  ci-green:
+    name: CI green
+    runs-on: ubuntu-latest
+    needs: [test]
+    if: ${{ always() }}
+    steps:
+      - name: Fail if any required job did not pass
+        run: |
+          if ${{ contains(needs.*.result, 'failure') || contains(needs.*.result, 'cancelled') }}; then
+            echo "A required job failed or was cancelled."
+            exit 1
+          fi
