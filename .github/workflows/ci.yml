@@ -30,10 +30,23 @@ jobs:
       - name: Test
         run: mvn -B --no-transfer-progress verify
 
+  conformance:
+    name: Conformance suite in sync
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - name: Verify vendored conformance matches the canonical suite
+        run: |
+          git clone --depth 1 https://github.com/BabelQueue/conformance.git "$RUNNER_TEMP/conformance"
+          diff -ru "$RUNNER_TEMP/conformance/manifest.json" "src/test/resources/conformance/manifest.json"
+          diff -ru "$RUNNER_TEMP/conformance/fixtures"      "src/test/resources/conformance/fixtures"
+          diff -ru "$RUNNER_TEMP/conformance/schema"        "src/test/resources/conformance/schema"
+          echo "Vendored conformance is in sync with the canonical suite."
+
   ci-green:
     name: CI green
     runs-on: ubuntu-latest
-    needs: [test]
+    needs: [test, conformance]
     if: ${{ always() }}
     steps:
       - name: Fail if any required job did not pass

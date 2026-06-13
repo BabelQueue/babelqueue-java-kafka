@@ -90,6 +90,13 @@
             <version>20240303</version>
             <scope>test</scope>
         </dependency>
+        <!-- Parses the vendored conformance manifest in KafkaConformanceTest. -->
+        <dependency>
+            <groupId>org.json</groupId>
+            <artifactId>json</artifactId>
+            <version>20240303</version>
+            <scope>test</scope>
+        </dependency>
         <!-- Silence kafka-clients' SLF4J "no provider" warning during tests. -->
         <dependency>
             <groupId>org.slf4j</groupId>
