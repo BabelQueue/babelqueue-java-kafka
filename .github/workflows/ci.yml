@@ -16,7 +16,7 @@ jobs:
       matrix:
         java: [ "17", "21" ]
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
 
       - uses: actions/setup-java@v4
         with:
@@ -34,7 +34,7 @@ jobs:
     name: Conformance suite in sync
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
       - name: Verify vendored conformance matches the canonical suite
         run: |
           git clone --depth 1 --branch v1.0.0 https://github.com/BabelQueue/conformance.git "$RUNNER_TEMP/conformance"
