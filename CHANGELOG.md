@@ -7,6 +7,11 @@ this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 The envelope wire format is versioned separately by `meta.schema_version`
 (currently **1**) — see the contract at [babelqueue.com](https://babelqueue.com).
 
+## [1.0.1] - 2026-10-03
+
+### Security
+- Bump `org.apache.kafka:kafka-clients` from 3.9.1 to 3.9.2 (security fix).
+
 ## [1.0.0] - 2026-06-13
 
 ### Added

@@ -30,7 +30,7 @@ counter — this transport absorbs all four in the binding layer (the envelope s
 <dependency>
   <groupId>com.babelqueue</groupId>
   <artifactId>babelqueue-kafka</artifactId>
-  <version>1.0.0</version>
+  <version>1.0.1</version>
 </dependency>
 ```
 
