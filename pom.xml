@@ -51,7 +51,7 @@
         <project.build.sourceEncoding>UTF-8</project.build.sourceEncoding>
         <project.reporting.outputEncoding>UTF-8</project.reporting.outputEncoding>
         <babelqueue-core.version>1.0.0</babelqueue-core.version>
-        <kafka.version>3.9.1</kafka.version>
+        <kafka.version>3.9.2</kafka.version>
         <junit.version>5.10.3</junit.version>
         <mockito.version>5.12.0</mockito.version>
     </properties>
