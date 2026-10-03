@@ -50,7 +50,7 @@
         <maven.compiler.release>17</maven.compiler.release>
         <project.build.sourceEncoding>UTF-8</project.build.sourceEncoding>
         <project.reporting.outputEncoding>UTF-8</project.reporting.outputEncoding>
-        <babelqueue-core.version>1.0.0</babelqueue-core.version>
+        <babelqueue-core.version>1.7.0</babelqueue-core.version>
         <kafka.version>3.9.2</kafka.version>
         <junit.version>5.10.3</junit.version>
         <mockito.version>5.12.0</mockito.version>
