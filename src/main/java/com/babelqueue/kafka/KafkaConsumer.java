@@ -34,6 +34,11 @@ import org.apache.kafka.common.header.Header;
  * block. Kafka exposes no native delivery count, so the {@code bq-attempts} header is the
  * authoritative counter (the body's {@code attempts} is the fallback for non-BabelQueue records).
  *
+ * <p>Every retry-tier / DLQ write (handler failure, poison body, non-conformant envelope, unmapped URN) is awaited
+ * and the offset is committed only once the broker confirmed it. If the write fails, nothing is committed, the
+ * partition is rewound ({@code seek}) to the failed record, the rest of that partition's batch is skipped and the
+ * failure goes to {@code onError}; the record is redelivered on the next poll, never lost.
+ *
  * <p>Per §6.7 the {@code bq-schema-version} header is checked <b>before</b> the body is decoded: when it
  * is present, not blank (empty or ASCII-whitespace-only) and not exactly
  * {@link EnvelopeCodec#SCHEMA_VERSION} (compared as sent, no trimming), the record is never decoded and
@@ -86,8 +91,9 @@ public final class KafkaConsumer {
     public int poll() {
         ConsumerRecords<byte[], byte[]> records = consumer.poll(pollTimeout);
         int count = 0;
-        // Partitions rewound by a gate-rejected record whose DLQ write failed: the rest of their batch is
-        // skipped (it is redelivered after the seek) so no later commit can move past the rewound record.
+        // Partitions rewound because a DLQ/retry write could not be confirmed (gate reject, poison body,
+        // retry-tier republish, terminal failure): the rest of their batch is skipped (it is redelivered
+        // after the seek) so no later commit can move past the rewound record.
         Set<TopicPartition> rewound = new HashSet<>();
         for (ConsumerRecord<byte[], byte[]> record : records) {
             count++;
@@ -106,7 +112,7 @@ public final class KafkaConsumer {
         }
     }
 
-    /** Route + settle one record. Returns {@code false} when the partition was rewound to this record (gate). */
+    /** Route + settle one record. Returns {@code false} when the partition was rewound to this record (an unconfirmed DLQ/retry write). */
     private boolean handle(ConsumerRecord<byte[], byte[]> record) {
         String declaredVersion = schemaVersionHeader(record);
         if (declaredVersion != null && !isBlankSchemaVersion(declaredVersion)
@@ -142,24 +148,20 @@ public final class KafkaConsumer {
         } catch (RuntimeException decodeError) {
             // Undecodable / poison body — cannot annotate; report and DLQ the raw record.
             report(decodeError, null, record);
-            deadLetterRaw(record);
-            commit(record);
-            return true;
+            return settle(record, null, () -> deadLetterRawConfirmed(record), "dead-letter an undecodable record");
         }
 
         if (!EnvelopeCodec.accepts(envelope)) {
             report(new BabelQueueException("Rejected a non-conformant BabelQueue envelope from Kafka."),
                 envelope, record);
-            deadLetter(envelope, record, "poison", null);
-            commit(record);
-            return true;
+            return settle(record, envelope, () -> deadLetter(envelope, record, "poison", null),
+                "dead-letter a non-conformant envelope");
         }
 
         String urn = urn(record, envelope);
         BabelHandler handler = handlers.get(urn);
         if (handler == null) {
-            onUnknownUrn(record, envelope, urn);
-            return true;
+            return onUnknownUrn(record, envelope, urn);
         }
 
         try {
@@ -167,10 +169,42 @@ public final class KafkaConsumer {
             commit(record);
         } catch (Exception error) {
             report(error, envelope, record);
-            retryOrDeadLetter(record, envelope, error);
-            commit(record);
+            return settle(record, envelope, () -> retryOrDeadLetter(record, envelope, error),
+                "republish a failed record to its retry tier / DLQ");
         }
         return true;
+    }
+
+    /**
+     * Run a retry/DLQ write that must be <b>confirmed</b> by the broker, then commit. If the write fails nothing is
+     * committed: the partition is rewound ({@code seek}) to {@code record}, the failure is reported, and the record is
+     * redelivered on the next poll — never lost. Returns {@code false} when rewound (the caller skips the rest of that
+     * partition's batch). A {@link BabelQueueException} (misconfiguration, e.g. no producer) is not a write failure and
+     * propagates unchanged. Settle first, report afterwards, so a throwing {@code onError} cannot bypass the seek.
+     */
+    private boolean settle(ConsumerRecord<byte[], byte[]> record, Envelope envelope, ConfirmedWrite write,
+                           String action) {
+        try {
+            write.run();
+        } catch (BabelQueueException misconfigured) {
+            throw misconfigured;
+        } catch (Exception failure) {
+            if (failure instanceof InterruptedException) {
+                Thread.currentThread().interrupt();
+            }
+            consumer.seek(new TopicPartition(record.topic(), record.partition()), record.offset());
+            report(new BabelQueueException("Could not " + action + "; offset not committed, partition rewound to offset "
+                + record.offset() + ".", failure), envelope, record);
+            return false;
+        }
+        commit(record);
+        return true;
+    }
+
+    /** A broker-confirmed write that may fail with any checked or unchecked exception. */
+    @FunctionalInterface
+    private interface ConfirmedWrite {
+        void run() throws Exception;
     }
 
     // -- attempt reconciliation -------------------------------------------------------------
@@ -183,16 +217,20 @@ public final class KafkaConsumer {
 
     // -- routing / failure paths ------------------------------------------------------------
 
-    private void onUnknownUrn(ConsumerRecord<byte[], byte[]> record, Envelope envelope, String urn) {
+    /** Returns {@code false} when the partition was rewound because a DLQ/retry write failed. */
+    private boolean onUnknownUrn(ConsumerRecord<byte[], byte[]> record, Envelope envelope, String urn) {
         switch (unknownUrn) {
-            case UnknownUrnStrategy.DELETE -> commit(record);
-            case UnknownUrnStrategy.DEAD_LETTER -> {
-                deadLetter(envelope, record, "unknown_urn", null);
+            case UnknownUrnStrategy.DELETE -> {
                 commit(record);
+                return true;
+            }
+            case UnknownUrnStrategy.DEAD_LETTER -> {
+                return settle(record, envelope, () -> deadLetter(envelope, record, "unknown_urn", null),
+                    "dead-letter a record with an unmapped URN");
             }
             case UnknownUrnStrategy.RELEASE -> {
-                republishRetry(record, envelope);
-                commit(record);
+                return settle(record, envelope, () -> republishRetry(record, envelope),
+                    "republish a record with an unmapped URN to its retry tier");
             }
             // FAIL (default): surface and do NOT commit — the record redelivers on the next poll.
             default -> {
@@ -202,7 +240,8 @@ public final class KafkaConsumer {
         }
     }
 
-    private void retryOrDeadLetter(ConsumerRecord<byte[], byte[]> record, Envelope envelope, Throwable error) {
+    private void retryOrDeadLetter(ConsumerRecord<byte[], byte[]> record, Envelope envelope, Throwable error)
+        throws Exception {
         boolean hasTiers = retryTopics != null && retryTopics.hasTiers();
         boolean hasDlq = retryTopics != null && retryTopics.dlqTopic() != null;
         if (!hasTiers && !hasDlq) {
@@ -219,7 +258,7 @@ public final class KafkaConsumer {
     }
 
     /** Republish the envelope to the next retry tier with {@code bq-attempts + 1} (§6.4–§6.5). */
-    private void republishRetry(ConsumerRecord<byte[], byte[]> record, Envelope envelope) {
+    private void republishRetry(ConsumerRecord<byte[], byte[]> record, Envelope envelope) throws Exception {
         if (retryTopics == null || !retryTopics.hasTiers()) {
             throw new BabelQueueException("Kafka retry/release requires retry topics; none are configured.");
         }
@@ -232,7 +271,8 @@ public final class KafkaConsumer {
         send(tier.topic(), bumped, headers, System.currentTimeMillis());
     }
 
-    private void deadLetter(Envelope envelope, ConsumerRecord<byte[], byte[]> record, String reason, Throwable error) {
+    private void deadLetter(Envelope envelope, ConsumerRecord<byte[], byte[]> record, String reason, Throwable error)
+        throws Exception {
         String dlq = retryTopics == null ? null : retryTopics.dlqTopic();
         if (dlq == null) {
             return; // dead-lettering disabled → degrade to commit-and-drop
@@ -246,20 +286,10 @@ public final class KafkaConsumer {
         send(dlq, annotated, headers, System.currentTimeMillis());
     }
 
-    /** Forward an undecodable record's raw bytes to the DLQ (no envelope to annotate). */
-    private void deadLetterRaw(ConsumerRecord<byte[], byte[]> record) {
-        String dlq = retryTopics == null ? null : retryTopics.dlqTopic();
-        if (dlq == null) {
-            return;
-        }
-        requireProducer();
-        producer.send(new ProducerRecord<>(dlq, null, System.currentTimeMillis(), record.key(),
-            record.value(), record.headers()));
-    }
-
     /**
-     * Like {@link #deadLetterRaw} but waits for the broker to acknowledge the write, so the caller can refuse to
-     * commit when it failed. No DLQ configured → nothing to confirm (commit-and-drop, as for every DLQ path).
+     * Forward an undecodable/rejected record's raw bytes to the DLQ (no envelope to annotate) and wait for the broker
+     * to acknowledge the write, so the caller can refuse to commit when it failed. No DLQ configured → nothing to
+     * confirm (commit-and-drop, as for every DLQ path).
      */
     private void deadLetterRawConfirmed(ConsumerRecord<byte[], byte[]> record) throws Exception {
         String dlq = retryTopics == null ? null : retryTopics.dlqTopic();
@@ -271,10 +301,11 @@ public final class KafkaConsumer {
             record.value(), record.headers())).get();
     }
 
-    private void send(String topic, Envelope envelope, List<Header> headers, long timestamp) {
+    /** Send and wait for the broker's acknowledgement; a failure surfaces so the caller never commits past it. */
+    private void send(String topic, Envelope envelope, List<Header> headers, long timestamp) throws Exception {
         requireProducer();
         byte[] value = EnvelopeCodec.encode(envelope).getBytes(StandardCharsets.UTF_8);
-        producer.send(new ProducerRecord<>(topic, null, timestamp, null, value, headers));
+        producer.send(new ProducerRecord<>(topic, null, timestamp, null, value, headers)).get();
     }
 
     // -- helpers ----------------------------------------------------------------------------

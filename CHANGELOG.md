@@ -9,6 +9,15 @@ The envelope wire format is versioned separately by `meta.schema_version`
 
 ## [Unreleased]
 
+### Fixed
+
+- `KafkaConsumer` no longer loses a record when a retry-tier / DLQ write fails on the non-gate paths
+  (handler failure -> retry tier or max-tries `<topic>.dlq`, undecodable body, non-conformant envelope,
+  unmapped URN under `dead_letter` / `release`). The write was fire-and-forget and the offset was committed
+  regardless; it is now awaited and the offset is committed only after the broker confirmed it. On failure
+  nothing is committed, the partition is rewound (`seek`) to the failed record, the rest of that partition's
+  batch is skipped and the failure is reported via `onError` - the same protection the §6.7 gate already had.
+
 ## [1.0.2] - 2026-10-10
 
 ### Fixed

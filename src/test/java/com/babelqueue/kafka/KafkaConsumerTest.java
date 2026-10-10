@@ -484,4 +484,177 @@ class KafkaConsumerTest {
         verify(consumer).commitSync(Map.of(TP, new OffsetAndMetadata(9)));
         verify(consumer, never()).seek(any(TopicPartition.class), org.mockito.ArgumentMatchers.anyLong());
     }
+
+    // -- DLQ / retry write failure on the non-gate paths: never commit past an unconfirmed write ----------
+
+    /** A producer whose every send fails asynchronously (the returned future completes exceptionally). */
+    private static MockProducer<byte[], byte[]> failingProducer() {
+        return new MockProducer<>(true, new ByteArraySerializer(), new ByteArraySerializer()) {
+            @Override
+            public synchronized java.util.concurrent.Future<org.apache.kafka.clients.producer.RecordMetadata> send(
+                ProducerRecord<byte[], byte[]> record) {
+                return java.util.concurrent.CompletableFuture.failedFuture(new RuntimeException("broker unavailable"));
+            }
+        };
+    }
+
+    @Test
+    void terminalFailureDlqWriteFailureDoesNotCommitAndRewinds() {
+        ConsumerRecord<byte[], byte[]> failing = recordFor(envelope(2), 7); // nextAttempt 3 == maxTries -> DLQ
+        ConsumerRecord<byte[], byte[]> later = recordFor(envelope(0), 8); // same partition, must be skipped
+        @SuppressWarnings("unchecked")
+        Consumer<byte[], byte[]> consumer = mock(Consumer.class);
+        when(consumer.poll(any())).thenReturn(new ConsumerRecords<>(Map.of(TP, List.of(failing, later))));
+        int[] handled = {0};
+        List<Throwable> errors = new ArrayList<>();
+
+        KafkaConsumer.builder(consumer)
+            .producer(failingProducer()).retryTopics(topology()).maxTries(3)
+            .handler(URN, (env, r) -> { handled[0]++; throw new IllegalStateException("boom"); })
+            .onError((e, env, r) -> errors.add(e))
+            .build()
+            .poll();
+
+        assertEquals(1, handled[0], "the record after the rewound one must not be handled");
+        verify(consumer, never()).commitSync(any(Map.class));
+        verify(consumer).seek(TP, 7L);
+        assertEquals(2, errors.size()); // the handler's own error + the DLQ write failure
+        assertTrue(errors.get(1).getMessage().contains("rewound to offset 7"), errors.get(1).getMessage());
+        assertEquals("broker unavailable", errors.get(1).getCause().getCause().getMessage());
+    }
+
+    @Test
+    void synchronousSendFailureDoesNotCommitAndRewinds() {
+        ConsumerRecord<byte[], byte[]> failing = recordFor(envelope(2), 7); // nextAttempt 3 == maxTries -> DLQ
+        Consumer<byte[], byte[]> consumer = consumerWith(failing);
+        List<Throwable> errors = new ArrayList<>();
+        // send() itself throws (buffer full / max.block.ms exceeded) instead of returning a failed future.
+        MockProducer<byte[], byte[]> throwingProducer =
+            new MockProducer<>(true, new ByteArraySerializer(), new ByteArraySerializer()) {
+                @Override
+                public synchronized java.util.concurrent.Future<org.apache.kafka.clients.producer.RecordMetadata> send(
+                    ProducerRecord<byte[], byte[]> record) {
+                    throw new org.apache.kafka.common.KafkaException("buffer full");
+                }
+            };
+
+        KafkaConsumer.builder(consumer)
+            .producer(throwingProducer).retryTopics(topology()).maxTries(3)
+            .handler(URN, (env, r) -> { throw new IllegalStateException("boom"); })
+            .onError((e, env, r) -> errors.add(e))
+            .build()
+            .poll();
+
+        verify(consumer, never()).commitSync(any(Map.class));
+        verify(consumer).seek(TP, 7L);
+        assertEquals(2, errors.size()); // the handler's own error + the DLQ write failure
+        assertTrue(errors.get(1).getMessage().contains("rewound to offset 7"), errors.get(1).getMessage());
+    }
+
+    @Test
+    void retryTierRepublishFailureDoesNotCommitAndRewinds() {
+        ConsumerRecord<byte[], byte[]> rec = recordFor(envelope(0), 10);
+        Consumer<byte[], byte[]> consumer = consumerWith(rec);
+        List<Throwable> errors = new ArrayList<>();
+
+        KafkaConsumer.builder(consumer)
+            .producer(failingProducer()).retryTopics(topology()).maxTries(3)
+            .handler(URN, (env, r) -> { throw new IllegalStateException("boom"); })
+            .onError((e, env, r) -> errors.add(e))
+            .build()
+            .poll();
+
+        verify(consumer, never()).commitSync(any(Map.class));
+        verify(consumer).seek(TP, 10L);
+        assertEquals(2, errors.size());
+    }
+
+    @Test
+    void poisonBodyDlqWriteFailureDoesNotCommitAndRewinds() {
+        ConsumerRecord<byte[], byte[]> rec = rawRecord("not-json".getBytes(StandardCharsets.UTF_8), 4);
+        Consumer<byte[], byte[]> consumer = consumerWith(rec);
+        List<Throwable> errors = new ArrayList<>();
+
+        KafkaConsumer.builder(consumer)
+            .producer(failingProducer()).retryTopics(topology())
+            .onError((e, env, r) -> errors.add(e))
+            .build()
+            .poll();
+
+        verify(consumer, never()).commitSync(any(Map.class));
+        verify(consumer).seek(TP, 4L);
+        assertEquals(2, errors.size()); // decode error + DLQ write failure
+    }
+
+    @Test
+    void nonConformantEnvelopeDlqWriteFailureDoesNotCommitAndRewinds() {
+        Envelope base = envelope(0);
+        Envelope nonConformant = new Envelope(base.job(), "", base.data(), base.meta(), 0, base.deadLetter()); // blank trace_id
+        ConsumerRecord<byte[], byte[]> rec = recordFor(nonConformant, 12);
+        Consumer<byte[], byte[]> consumer = consumerWith(rec);
+        int[] handled = {0};
+        List<Throwable> errors = new ArrayList<>();
+
+        KafkaConsumer.builder(consumer)
+            .producer(failingProducer()).retryTopics(topology())
+            .handler(URN, (env, r) -> handled[0]++)
+            .onError((e, env, r) -> errors.add(e))
+            .build()
+            .poll();
+
+        assertEquals(0, handled[0]);
+        verify(consumer, never()).commitSync(any(Map.class));
+        verify(consumer).seek(TP, 12L);
+        assertEquals(2, errors.size());
+    }
+
+    @Test
+    void unknownUrnDeadLetterWriteFailureDoesNotCommitAndRewinds() {
+        ConsumerRecord<byte[], byte[]> rec = recordFor(envelope(0), 2);
+        Consumer<byte[], byte[]> consumer = consumerWith(rec);
+        List<Throwable> errors = new ArrayList<>();
+
+        KafkaConsumer.builder(consumer)
+            .producer(failingProducer()).retryTopics(topology())
+            .unknownUrn(UnknownUrnStrategy.DEAD_LETTER)
+            .onError((e, env, r) -> errors.add(e))
+            .build()
+            .poll();
+
+        verify(consumer, never()).commitSync(any(Map.class));
+        verify(consumer).seek(TP, 2L);
+        assertEquals(1, errors.size());
+        assertTrue(errors.get(0).getMessage().contains("rewound to offset 2"), errors.get(0).getMessage());
+    }
+
+    @Test
+    void unknownUrnReleaseRepublishFailureDoesNotCommitAndRewinds() {
+        ConsumerRecord<byte[], byte[]> rec = recordFor(envelope(0), 6);
+        Consumer<byte[], byte[]> consumer = consumerWith(rec);
+
+        KafkaConsumer.builder(consumer)
+            .producer(failingProducer()).retryTopics(topology())
+            .unknownUrn(UnknownUrnStrategy.RELEASE)
+            .build()
+            .poll();
+
+        verify(consumer, never()).commitSync(any(Map.class));
+        verify(consumer).seek(TP, 6L);
+    }
+
+    @Test
+    void dlqWriteFailureWithThrowingOnErrorStillRewinds() {
+        ConsumerRecord<byte[], byte[]> rec = recordFor(envelope(2), 7);
+        Consumer<byte[], byte[]> consumer = consumerWith(rec);
+
+        KafkaConsumer worker = KafkaConsumer.builder(consumer)
+            .producer(failingProducer()).retryTopics(topology()).maxTries(3)
+            .handler(URN, (env, r) -> { throw new IllegalStateException("boom"); })
+            .onError((e, env, r) -> { if (e instanceof BabelQueueException) { throw new IllegalArgumentException("onError blew up"); } })
+            .build();
+
+        assertThrows(IllegalArgumentException.class, worker::poll);
+        verify(consumer).seek(TP, 7L);
+        verify(consumer, never()).commitSync(any(Map.class));
+    }
 }
