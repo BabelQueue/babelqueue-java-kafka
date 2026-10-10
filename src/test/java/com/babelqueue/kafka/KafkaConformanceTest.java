@@ -22,6 +22,7 @@ import org.apache.kafka.clients.consumer.OffsetAndMetadata;
 import org.apache.kafka.clients.producer.MockProducer;
 import org.apache.kafka.common.serialization.ByteArraySerializer;
 import org.apache.kafka.common.TopicPartition;
+import org.apache.kafka.common.header.internals.RecordHeader;
 import org.apache.kafka.common.header.internals.RecordHeaders;
 import org.apache.kafka.common.record.TimestampType;
 import org.json.JSONArray;
@@ -107,10 +108,14 @@ class KafkaConformanceTest {
         for (int i = 0; i < cases.length(); i++) {
             JSONObject testCase = cases.getJSONObject(i);
             boolean decode = "decode".equals(testCase.getString("expect"));
-            String label = testCase.has("value") ? "value=" + testCase.getString("value") : "absent";
+            boolean jsonNull = testCase.has("value") && testCase.isNull("value");
+            String label = jsonNull ? "null" : testCase.has("value") ? "value=" + testCase.getString("value") : "absent";
 
             RecordHeaders headers = new RecordHeaders();
-            if (testCase.has("value")) {
+            if (jsonNull) {
+                // A header present with a null value (§6.7: null value = header absent).
+                headers.add(new RecordHeader(property, null));
+            } else if (testCase.has("value")) {
                 headers.add(KafkaHeaders.header(property, testCase.getString("value")));
             }
             ConsumerRecord<byte[], byte[]> record = new ConsumerRecord<>(
