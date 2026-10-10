@@ -26,8 +26,16 @@ jobs:
           gpg-private-key: ${{ secrets.GPG_PRIVATE_KEY }}
           gpg-passphrase: MAVEN_GPG_PASSPHRASE
 
+      # Maven 3.10 writes maven-metadata-local.xml into the Central staging repo; Central then
+      # rejects the bundle ("content that does NOT have a .pom file"). Pin 3.9 until the
+      # central-publishing-maven-plugin handles it.
+      - name: Install Maven 3.9
+        run: |
+          curl -fsSL https://archive.apache.org/dist/maven/maven-3/3.9.11/binaries/apache-maven-3.9.11-bin.tar.gz | tar xz -C "$RUNNER_TEMP"
+          echo "$RUNNER_TEMP/apache-maven-3.9.11/bin" >> "$GITHUB_PATH"
+
       - name: Run tests
-        run: mvn -B --no-transfer-progress verify
+        run: mvn -B --no-transfer-progress -v && mvn -B --no-transfer-progress verify
 
       - name: Publish to Maven Central
         run: mvn -B --no-transfer-progress -Prelease -DskipTests deploy
