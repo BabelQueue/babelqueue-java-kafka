@@ -88,6 +88,12 @@ A throwing handler republishes the envelope to the next `<topic>.retry.<n>` tier
 `dead_letter` block. The consumer routes on the `bq-job` header, so it never decodes a record
 it cannot handle. Unknown-URN strategy is one of `fail` / `delete` / `release` / `dead_letter`.
 
+**Schema-version gate (§6.7).** Before decoding the value the consumer reads the
+`bq-schema-version` header (UTF-8). Absent or blank (empty / ASCII whitespace only) → normal decode.
+Any other value that is not exactly `1` (no trimming — `"2"`, `"x"`, `" 1"`) → the record is **not**
+decoded and the handler is not called: `onError` is notified with a `null` envelope, the raw record
+is forwarded to `<topic>.dlq` (if configured) and the offset is committed.
+
 > The retry/DLQ records are produced with `bq-delay` set; re-injecting a retry-topic record
 > into the work topic after its tier delay is done by running a worker on the retry topics —
 > the cooperative, partition-paused delay of §6.4. (A bundled re-injection runtime is a

@@ -7,6 +7,21 @@ this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 The envelope wire format is versioned separately by `meta.schema_version`
 (currently **1**) — see the contract at [babelqueue.com](https://babelqueue.com).
 
+## [Unreleased]
+
+### Fixed
+
+- `KafkaConsumer` now applies the §6.7 schema-version gate **before** decoding the body: when the
+  `bq-schema-version` header is present and is not the supported version (`1`), the record is never
+  decoded and the handler is never called; it is reported via `onError` (with a `null` envelope), its raw
+  bytes are forwarded to `<topic>.dlq` (when configured) and the offset is committed so the partition
+  advances. A missing or blank header (empty or ASCII-whitespace-only) keeps the existing decode path.
+  Cross-SDK parity (GR-5): the header is read as UTF-8 and compared exactly, with no trimming.
+  The gate waits for the DLQ write to be confirmed before committing; if it fails, nothing is committed,
+  the partition is rewound (`seek`) to the rejected record, the rest of that partition's batch is skipped and
+  the failure goes to `onError`, so the record is redelivered and rejected again instead of being lost.
+- Build: removed a duplicate `org.json:json` test dependency from `pom.xml` that made Maven reject the POM.
+
 ## [1.0.1] - 2026-10-03
 
 ### Security

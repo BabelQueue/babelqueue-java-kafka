@@ -1,20 +1,26 @@
 package com.babelqueue.kafka;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.Mockito.mock;
+import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.when;
 
 import com.babelqueue.Envelope;
 import com.babelqueue.EnvelopeCodec;
 import java.io.InputStream;
 import java.nio.charset.StandardCharsets;
+import java.time.Duration;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
 import org.apache.kafka.clients.consumer.Consumer;
 import org.apache.kafka.clients.consumer.ConsumerRecord;
 import org.apache.kafka.clients.consumer.ConsumerRecords;
+import org.apache.kafka.clients.consumer.OffsetAndMetadata;
+import org.apache.kafka.clients.producer.MockProducer;
+import org.apache.kafka.common.serialization.ByteArraySerializer;
 import org.apache.kafka.common.TopicPartition;
 import org.apache.kafka.common.header.internals.RecordHeaders;
 import org.apache.kafka.common.record.TimestampType;
@@ -86,6 +92,50 @@ class KafkaConformanceTest {
                 .poll();
 
             assertEquals(testCase.getInt("expected_attempts"), seen[0], testCase.getString("name"));
+        }
+    }
+
+    @Test
+    @SuppressWarnings("unchecked")
+    void schemaVersionGateMatchesGolden() throws Exception {
+        JSONObject gate = kafkaBlock().getJSONObject("schema_version_gate");
+        String property = gate.getString("property");
+        byte[] value = resource(gate.getString("fixture")).getBytes(StandardCharsets.UTF_8);
+        JSONArray cases = gate.getJSONArray("cases");
+        assertTrue(cases.length() > 0);
+
+        for (int i = 0; i < cases.length(); i++) {
+            JSONObject testCase = cases.getJSONObject(i);
+            boolean decode = "decode".equals(testCase.getString("expect"));
+            String label = testCase.has("value") ? "value=" + testCase.getString("value") : "absent";
+
+            RecordHeaders headers = new RecordHeaders();
+            if (testCase.has("value")) {
+                headers.add(KafkaHeaders.header(property, testCase.getString("value")));
+            }
+            ConsumerRecord<byte[], byte[]> record = new ConsumerRecord<>(
+                "orders", 0, i, 0L, TimestampType.CREATE_TIME, -1, value.length, null, value, headers, Optional.empty());
+            Consumer<byte[], byte[]> consumer = mock(Consumer.class);
+            when(consumer.poll(any())).thenReturn(
+                new ConsumerRecords<>(Map.of(new TopicPartition("orders", 0), List.of(record))));
+            MockProducer<byte[], byte[]> producer =
+                new MockProducer<>(true, new ByteArraySerializer(), new ByteArraySerializer());
+
+            int[] handled = {0};
+            KafkaConsumer.builder(consumer)
+                .producer(producer)
+                .retryTopics(RetryTopics.forTopic("orders").tier(Duration.ofSeconds(5)).build())
+                .handler(URN, (envelopeIn, recordIn) -> handled[0]++)
+                .build()
+                .poll();
+
+            assertEquals(decode ? 1 : 0, handled[0], label);
+            // Reject = poison path: the raw record lands on the DLQ and the offset is committed.
+            assertEquals(decode ? 0 : 1, producer.history().size(), label);
+            if (!decode) {
+                assertEquals("orders.dlq", producer.history().get(0).topic(), label);
+            }
+            verify(consumer).commitSync(Map.of(new TopicPartition("orders", 0), new OffsetAndMetadata(i + 1L)));
         }
     }
 }

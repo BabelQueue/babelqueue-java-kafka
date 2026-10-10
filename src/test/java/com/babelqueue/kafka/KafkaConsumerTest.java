@@ -2,7 +2,9 @@ package com.babelqueue.kafka;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertInstanceOf;
+import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertThrows;
+import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.never;
@@ -16,6 +18,7 @@ import com.babelqueue.UnknownUrnException;
 import com.babelqueue.UnknownUrnStrategy;
 import java.nio.charset.StandardCharsets;
 import java.time.Duration;
+import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
@@ -276,5 +279,209 @@ class KafkaConsumerTest {
         Consumer<byte[], byte[]> consumer = mock(Consumer.class);
         KafkaConsumer.builder(consumer).build().run(() -> false);
         verify(consumer, never()).poll(any());
+    }
+
+    // ---- §6.7 schema-version gate -------------------------------------------------------------
+
+    private static ConsumerRecord<byte[], byte[]> versionedRecord(byte[] value, String version, long offset) {
+        RecordHeaders headers = new RecordHeaders();
+        if (version != null) {
+            headers.add(KafkaHeaders.header(KafkaHeaders.SCHEMA_VERSION, version));
+        }
+        return new ConsumerRecord<>("orders", 0, offset, 0L, TimestampType.CREATE_TIME,
+            -1, value.length, null, value, headers, Optional.empty());
+    }
+
+    @Test
+    void schemaVersionGateDecodesWhenHeaderMissingBlankOrSupported() {
+        byte[] body = EnvelopeCodec.encode(envelope(0)).getBytes(StandardCharsets.UTF_8);
+        String[] versions = {null, "", " \t", "\n\u000b\f\r", "1"};
+        for (String version : versions) {
+            Consumer<byte[], byte[]> consumer = consumerWith(versionedRecord(body, version, 3));
+            int[] handled = {0};
+
+            KafkaConsumer.builder(consumer).handler(URN, (env, r) -> handled[0]++).build().poll();
+
+            assertEquals(1, handled[0], "version=" + version);
+            verify(consumer).commitSync(Map.of(TP, new OffsetAndMetadata(4)));
+        }
+    }
+
+    @Test
+    void schemaVersionGateQuarantinesUnsupportedWithoutDecodingOrHandler() {
+        for (String version : new String[] {"2", "x"}) {
+            // A non-JSON body proves the body is never decoded (decode would take the same poison path,
+            // but the reported error would be a decode error, not the gate's).
+            byte[] body = "not-json".getBytes(StandardCharsets.UTF_8);
+            Consumer<byte[], byte[]> consumer = consumerWith(versionedRecord(body, version, 8));
+            MockProducer<byte[], byte[]> producer = producer();
+            int[] handled = {0};
+            List<Throwable> errors = new ArrayList<>();
+            List<Envelope> envelopes = new ArrayList<>();
+
+            KafkaConsumer.builder(consumer)
+                .producer(producer).retryTopics(topology())
+                .handler(URN, (env, r) -> handled[0]++)
+                .onError((e, env, r) -> {
+                    errors.add(e);
+                    envelopes.add(env);
+                })
+                .build()
+                .poll();
+
+            assertEquals(0, handled[0], "version=" + version);
+            assertEquals(1, errors.size());
+            assertInstanceOf(BabelQueueException.class, errors.get(0));
+            assertTrue(errors.get(0).getMessage().contains("unsupported"), errors.get(0).getMessage());
+            assertNull(envelopes.get(0));
+            assertEquals(1, producer.history().size(), "version=" + version);
+            ProducerRecord<byte[], byte[]> dlq = producer.history().get(0);
+            assertEquals("orders.dlq", dlq.topic());
+            assertEquals("not-json", new String(dlq.value(), StandardCharsets.UTF_8));
+            assertEquals(version, KafkaHeaders.string(dlq.headers(), KafkaHeaders.SCHEMA_VERSION));
+            verify(consumer).commitSync(Map.of(TP, new OffsetAndMetadata(9)));
+        }
+    }
+
+    @Test
+    void schemaVersionGateDlqAsyncFailureDoesNotCommitAndRewinds() {
+        byte[] body = "not-json".getBytes(StandardCharsets.UTF_8);
+        ConsumerRecord<byte[], byte[]> gated = versionedRecord(body, "2", 8);
+        ConsumerRecord<byte[], byte[]> later = recordFor(envelope(0), 9); // same partition, after the gated one
+        @SuppressWarnings("unchecked")
+        Consumer<byte[], byte[]> consumer = mock(Consumer.class);
+        when(consumer.poll(any())).thenReturn(new ConsumerRecords<>(Map.of(TP, List.of(gated, later))));
+        // autoComplete=false: the send future stays pending until errorNext() fails it.
+        MockProducer<byte[], byte[]> producer =
+            new MockProducer<>(false, new ByteArraySerializer(), new ByteArraySerializer());
+        Thread failer = new Thread(() -> {
+            while (producer.history().isEmpty()) {
+                Thread.onSpinWait();
+            }
+            producer.errorNext(new RuntimeException("dlq unavailable"));
+        });
+        failer.start();
+        int[] handled = {0};
+        List<Throwable> errors = new ArrayList<>();
+
+        KafkaConsumer.builder(consumer)
+            .producer(producer).retryTopics(topology())
+            .handler(URN, (env, r) -> handled[0]++)
+            .onError((e, env, r) -> errors.add(e))
+            .build()
+            .poll();
+
+        assertEquals(0, handled[0], "the gated record and the rest of its batch must not reach the handler");
+        verify(consumer, never()).commitSync(any(Map.class));
+        verify(consumer).seek(TP, 8L);
+        assertEquals(2, errors.size());
+        assertTrue(errors.get(0).getMessage().contains("unsupported"), errors.get(0).getMessage());
+        assertTrue(errors.get(1).getMessage().contains("rewound to offset 8"), errors.get(1).getMessage());
+        assertEquals("dlq unavailable", errors.get(1).getCause().getCause().getMessage());
+    }
+
+    @Test
+    void schemaVersionGateDlqSyncFailureDoesNotCommitAndRewinds() {
+        byte[] body = "not-json".getBytes(StandardCharsets.UTF_8);
+        Consumer<byte[], byte[]> consumer = consumerWith(versionedRecord(body, "2", 8));
+        MockProducer<byte[], byte[]> producer = new MockProducer<>(true, new ByteArraySerializer(), new ByteArraySerializer()) {
+            @Override
+            public synchronized java.util.concurrent.Future<org.apache.kafka.clients.producer.RecordMetadata> send(
+                ProducerRecord<byte[], byte[]> record) {
+                throw new IllegalStateException("buffer full");
+            }
+        };
+        int[] handled = {0};
+        List<Throwable> errors = new ArrayList<>();
+
+        KafkaConsumer.builder(consumer)
+            .producer(producer).retryTopics(topology())
+            .handler(URN, (env, r) -> handled[0]++)
+            .onError((e, env, r) -> errors.add(e))
+            .build()
+            .poll();
+
+        assertEquals(0, handled[0]);
+        verify(consumer, never()).commitSync(any(Map.class));
+        verify(consumer).seek(TP, 8L);
+        assertEquals(2, errors.size());
+        assertInstanceOf(IllegalStateException.class, errors.get(1).getCause());
+    }
+
+    @Test
+    void schemaVersionGateRewoundRecordIsRedeliveredAndRejectedAgain() {
+        byte[] body = "not-json".getBytes(StandardCharsets.UTF_8);
+        ConsumerRecord<byte[], byte[]> gated = versionedRecord(body, "2", 8);
+        @SuppressWarnings("unchecked")
+        Consumer<byte[], byte[]> consumer = mock(Consumer.class);
+        when(consumer.poll(any())).thenReturn(new ConsumerRecords<>(Map.of(TP, List.of(gated))));
+        boolean[] dlqDown = {true};
+        MockProducer<byte[], byte[]> producer = new MockProducer<>(true, new ByteArraySerializer(), new ByteArraySerializer()) {
+            @Override
+            public synchronized java.util.concurrent.Future<org.apache.kafka.clients.producer.RecordMetadata> send(
+                ProducerRecord<byte[], byte[]> record) {
+                if (dlqDown[0]) {
+                    throw new IllegalStateException("dlq down");
+                }
+                return super.send(record);
+            }
+        };
+        int[] handled = {0};
+        KafkaConsumer worker = KafkaConsumer.builder(consumer)
+            .producer(producer).retryTopics(topology())
+            .handler(URN, (env, r) -> handled[0]++)
+            .build();
+
+        worker.poll(); // DLQ down: rewound, nothing committed
+        verify(consumer, never()).commitSync(any(Map.class));
+        dlqDown[0] = false;
+        worker.poll(); // the same record is redelivered: rejected again, now dead-lettered and committed
+
+        assertEquals(0, handled[0]);
+        assertEquals(1, producer.history().size());
+        assertEquals("orders.dlq", producer.history().get(0).topic());
+        verify(consumer).commitSync(Map.of(TP, new OffsetAndMetadata(9)));
+    }
+
+    @Test
+    void schemaVersionGateThrowingOnErrorStillRewindsWhenDlqFails() {
+        byte[] body = "not-json".getBytes(StandardCharsets.UTF_8);
+        Consumer<byte[], byte[]> consumer = consumerWith(versionedRecord(body, "2", 8));
+        MockProducer<byte[], byte[]> producer = new MockProducer<>(true, new ByteArraySerializer(), new ByteArraySerializer()) {
+            @Override
+            public synchronized java.util.concurrent.Future<org.apache.kafka.clients.producer.RecordMetadata> send(
+                ProducerRecord<byte[], byte[]> record) {
+                throw new IllegalStateException("dlq down");
+            }
+        };
+        int[] handled = {0};
+
+        KafkaConsumer worker = KafkaConsumer.builder(consumer)
+            .producer(producer).retryTopics(topology())
+            .handler(URN, (env, r) -> handled[0]++)
+            .onError((e, env, r) -> { throw new IllegalArgumentException("onError blew up"); })
+            .build();
+
+        assertThrows(IllegalArgumentException.class, worker::poll);
+        assertEquals(0, handled[0]);
+        verify(consumer).seek(TP, 8L);
+        verify(consumer, never()).commitSync(any(Map.class));
+    }
+
+    @Test
+    void schemaVersionGateThrowingOnErrorStillCommitsAfterDlqSuccess() {
+        byte[] body = "not-json".getBytes(StandardCharsets.UTF_8);
+        Consumer<byte[], byte[]> consumer = consumerWith(versionedRecord(body, "2", 8));
+        MockProducer<byte[], byte[]> producer = producer();
+
+        KafkaConsumer worker = KafkaConsumer.builder(consumer)
+            .producer(producer).retryTopics(topology())
+            .onError((e, env, r) -> { throw new IllegalArgumentException("onError blew up"); })
+            .build();
+
+        assertThrows(IllegalArgumentException.class, worker::poll);
+        assertEquals(1, producer.history().size());
+        verify(consumer).commitSync(Map.of(TP, new OffsetAndMetadata(9)));
+        verify(consumer, never()).seek(any(TopicPartition.class), org.mockito.ArgumentMatchers.anyLong());
     }
 }

@@ -9,9 +9,11 @@ import com.babelqueue.UnknownUrnStrategy;
 import java.nio.charset.StandardCharsets;
 import java.time.Duration;
 import java.util.HashMap;
+import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Objects;
+import java.util.Set;
 import java.util.function.BooleanSupplier;
 import org.apache.kafka.clients.consumer.Consumer;
 import org.apache.kafka.clients.consumer.ConsumerRecord;
@@ -32,11 +34,25 @@ import org.apache.kafka.common.header.Header;
  * block. Kafka exposes no native delivery count, so the {@code bq-attempts} header is the
  * authoritative counter (the body's {@code attempts} is the fallback for non-BabelQueue records).
  *
+ * <p>Per §6.7 the {@code bq-schema-version} header is checked <b>before</b> the body is decoded: when it
+ * is present, not blank (empty or ASCII-whitespace-only) and not exactly
+ * {@link EnvelopeCodec#SCHEMA_VERSION} (compared as sent, no trimming), the record is never decoded and
+ * the handler is never called — it goes down the poison path: {@code onError} (with a {@code null}
+ * envelope), the raw record forwarded to {@code <topic>.dlq} (when configured), then the offset is
+ * committed — but only after the DLQ write is <b>confirmed</b>. If it fails, nothing is committed, the
+ * partition is rewound ({@code seek}) to the rejected record, the rest of that partition's batch is skipped and
+ * the failure is reported to {@code onError}; the record is redelivered on the next poll and rejected again,
+ * never lost and never handled. An absent or blank header changes nothing, and the post-decode
+ * {@link EnvelopeCodec#accepts} check still applies.
+ *
  * <p>Not thread-safe — a Kafka consumer is single-threaded by design; run one per thread.
  */
 public final class KafkaConsumer {
 
-    /** Notified of a non-conformant/poison record, an unmapped URN, or a throwing handler. */
+    /**
+     * Notified of a non-conformant/poison record, an unmapped URN, a throwing handler, or a record rejected by
+     * the §6.7 schema-version gate. {@code envelope} is {@code null} when the body was not decoded.
+     */
     @FunctionalInterface
     public interface ErrorHandler {
         void onError(Throwable error, Envelope envelope, ConsumerRecord<byte[], byte[]> record);
@@ -70,9 +86,15 @@ public final class KafkaConsumer {
     public int poll() {
         ConsumerRecords<byte[], byte[]> records = consumer.poll(pollTimeout);
         int count = 0;
+        // Partitions rewound by a gate-rejected record whose DLQ write failed: the rest of their batch is
+        // skipped (it is redelivered after the seek) so no later commit can move past the rewound record.
+        Set<TopicPartition> rewound = new HashSet<>();
         for (ConsumerRecord<byte[], byte[]> record : records) {
-            handle(record);
             count++;
+            TopicPartition tp = new TopicPartition(record.topic(), record.partition());
+            if (!rewound.contains(tp) && !handle(record)) {
+                rewound.add(tp);
+            }
         }
         return count;
     }
@@ -84,7 +106,36 @@ public final class KafkaConsumer {
         }
     }
 
-    private void handle(ConsumerRecord<byte[], byte[]> record) {
+    /** Route + settle one record. Returns {@code false} when the partition was rewound to this record (gate). */
+    private boolean handle(ConsumerRecord<byte[], byte[]> record) {
+        String declaredVersion = schemaVersionHeader(record);
+        if (declaredVersion != null && !isBlankSchemaVersion(declaredVersion)
+            && !declaredVersion.equals(Integer.toString(EnvelopeCodec.SCHEMA_VERSION))) {
+            // §6.7: reject/quarantine WITHOUT decoding — never best-effort parse an unknown schema.
+            BabelQueueException rejected = new BabelQueueException("Rejected a BabelQueue record with unsupported "
+                + KafkaHeaders.SCHEMA_VERSION + " header '" + declaredVersion + "' (supported: "
+                + EnvelopeCodec.SCHEMA_VERSION + "); body not decoded.");
+            // A rejected record must never be lost: commit only once the DLQ write is confirmed; otherwise
+            // rewind so the record is redelivered (and rejected again) instead of being skipped. Settle
+            // first, report afterwards, so a throwing onError cannot bypass the commit/seek protection.
+            try {
+                deadLetterRawConfirmed(record);
+            } catch (Exception dlqFailure) {
+                if (dlqFailure instanceof InterruptedException) {
+                    Thread.currentThread().interrupt();
+                }
+                consumer.seek(new TopicPartition(record.topic(), record.partition()), record.offset());
+                report(rejected, null, record);
+                report(new BabelQueueException("Could not dead-letter a record rejected by the "
+                    + KafkaHeaders.SCHEMA_VERSION + " gate; offset not committed, partition rewound to offset "
+                    + record.offset() + ".", dlqFailure), null, record);
+                return false;
+            }
+            commit(record);
+            report(rejected, null, record);
+            return true;
+        }
+
         Envelope envelope;
         try {
             envelope = reconcile(EnvelopeCodec.decode(value(record)), record);
@@ -93,7 +144,7 @@ public final class KafkaConsumer {
             report(decodeError, null, record);
             deadLetterRaw(record);
             commit(record);
-            return;
+            return true;
         }
 
         if (!EnvelopeCodec.accepts(envelope)) {
@@ -101,14 +152,14 @@ public final class KafkaConsumer {
                 envelope, record);
             deadLetter(envelope, record, "poison", null);
             commit(record);
-            return;
+            return true;
         }
 
         String urn = urn(record, envelope);
         BabelHandler handler = handlers.get(urn);
         if (handler == null) {
             onUnknownUrn(record, envelope, urn);
-            return;
+            return true;
         }
 
         try {
@@ -119,6 +170,7 @@ public final class KafkaConsumer {
             retryOrDeadLetter(record, envelope, error);
             commit(record);
         }
+        return true;
     }
 
     // -- attempt reconciliation -------------------------------------------------------------
@@ -205,6 +257,20 @@ public final class KafkaConsumer {
             record.value(), record.headers()));
     }
 
+    /**
+     * Like {@link #deadLetterRaw} but waits for the broker to acknowledge the write, so the caller can refuse to
+     * commit when it failed. No DLQ configured → nothing to confirm (commit-and-drop, as for every DLQ path).
+     */
+    private void deadLetterRawConfirmed(ConsumerRecord<byte[], byte[]> record) throws Exception {
+        String dlq = retryTopics == null ? null : retryTopics.dlqTopic();
+        if (dlq == null) {
+            return;
+        }
+        requireProducer();
+        producer.send(new ProducerRecord<>(dlq, null, System.currentTimeMillis(), record.key(),
+            record.value(), record.headers())).get();
+    }
+
     private void send(String topic, Envelope envelope, List<Header> headers, long timestamp) {
         requireProducer();
         byte[] value = EnvelopeCodec.encode(envelope).getBytes(StandardCharsets.UTF_8);
@@ -226,6 +292,27 @@ public final class KafkaConsumer {
     private static String originalTopic(ConsumerRecord<byte[], byte[]> record) {
         String original = KafkaHeaders.string(record.headers(), KafkaHeaders.ORIGINAL_TOPIC);
         return original != null ? original : record.topic();
+    }
+
+    /** The raw {@code bq-schema-version} header as UTF-8, or {@code null} when absent (or valueless). */
+    private static String schemaVersionHeader(ConsumerRecord<byte[], byte[]> record) {
+        Header header = record.headers().lastHeader(KafkaHeaders.SCHEMA_VERSION);
+        return header == null || header.value() == null ? null : new String(header.value(), StandardCharsets.UTF_8);
+    }
+
+    /**
+     * The shared cross-SDK "blank" definition for {@code bq-schema-version}: the empty string, or a value made up
+     * <b>only</b> of ASCII whitespace ({@code ' '}, {@code \t}, {@code \n}, U+000B, {@code \f}, {@code \r}). Anything else
+     * (NBSP, U+001C–U+001F, U+0085, U+FEFF, …) is <b>not</b> blank, unlike {@link String#isBlank()}.
+     */
+    private static boolean isBlankSchemaVersion(String value) {
+        for (int i = 0; i < value.length(); i++) {
+            char c = value.charAt(i);
+            if (c != ' ' && (c < '\t' || c > '\r')) {
+                return false;
+            }
+        }
+        return true;
     }
 
     private static String value(ConsumerRecord<byte[], byte[]> record) {
