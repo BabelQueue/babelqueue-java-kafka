@@ -7,7 +7,7 @@ this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 The envelope wire format is versioned separately by `meta.schema_version`
 (currently **1**) — see the contract at [babelqueue.com](https://babelqueue.com).
 
-## [Unreleased]
+## [1.1.0] - 2026-10-11
 
 ### Added
 
@@ -18,9 +18,8 @@ The envelope wire format is versioned separately by `meta.schema_version`
   synthesised; contract §6.5). The `bq-` headers are re-projected from the body being published. The replay-bypass
   header is not propagated by this transport. A restore write (dry run, unselected, undecodable, failed redrive
   write) re-writes the DLQ record verbatim: its original value bytes (a null value stays null; a value that is not
-  valid UTF-8 is never altered), headers and key, with a fresh timestamp. **Requires `babelqueue-core` 1.9.0 (the
-  MINOR after 1.8.0, which ships `Redrive.KeyedRepublisher`); `babelqueue-core.version` is pinned to it. 1.9.0 is not
-  published yet: do not push or release this module until `babelqueue-core:1.9.0` is on Maven Central.**
+  valid UTF-8 is never altered), headers and key, with a fresh timestamp. **Requires `babelqueue-core` 1.9.0**, which ships
+  `Redrive.KeyedRepublisher`; `babelqueue-core.version` is pinned to it.
 
 ### Fixed
 
