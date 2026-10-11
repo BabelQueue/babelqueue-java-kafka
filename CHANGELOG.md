@@ -9,6 +9,8 @@ The envelope wire format is versioned separately by `meta.schema_version`
 
 ## [Unreleased]
 
+## [1.0.4] - 2026-10-11
+
 ### Fixed
 
 - The original Kafka record key is now preserved when the consumer republishes a record: the retry-tier write, the
