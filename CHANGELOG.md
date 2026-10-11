@@ -9,6 +9,8 @@ The envelope wire format is versioned separately by `meta.schema_version`
 
 ## [Unreleased]
 
+## [1.0.3] - 2026-10-11
+
 ### Fixed
 
 - `KafkaConsumer` no longer loses a record when a retry-tier / DLQ write fails on the non-gate paths
