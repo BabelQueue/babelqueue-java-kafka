@@ -462,7 +462,7 @@ class KafkaConsumerTest {
             .onError((e, env, r) -> { throw new IllegalArgumentException("onError blew up"); })
             .build();
 
-        assertThrows(IllegalArgumentException.class, worker::poll);
+        worker.poll(); // a throwing onError is swallowed
         assertEquals(0, handled[0]);
         verify(consumer).seek(TP, 8L);
         verify(consumer, never()).commitSync(any(Map.class));
@@ -479,7 +479,7 @@ class KafkaConsumerTest {
             .onError((e, env, r) -> { throw new IllegalArgumentException("onError blew up"); })
             .build();
 
-        assertThrows(IllegalArgumentException.class, worker::poll);
+        worker.poll(); // a throwing onError is swallowed
         assertEquals(1, producer.history().size());
         verify(consumer).commitSync(Map.of(TP, new OffsetAndMetadata(9)));
         verify(consumer, never()).seek(any(TopicPartition.class), org.mockito.ArgumentMatchers.anyLong());
@@ -518,9 +518,10 @@ class KafkaConsumerTest {
         assertEquals(1, handled[0], "the record after the rewound one must not be handled");
         verify(consumer, never()).commitSync(any(Map.class));
         verify(consumer).seek(TP, 7L);
-        assertEquals(2, errors.size()); // the handler's own error + the DLQ write failure
-        assertTrue(errors.get(1).getMessage().contains("rewound to offset 7"), errors.get(1).getMessage());
-        assertEquals("broker unavailable", errors.get(1).getCause().getCause().getMessage());
+        assertEquals(2, errors.size()); // settlement failure first, then the handler's own error (settle, then report)
+        assertTrue(errors.get(0).getMessage().contains("rewound to offset 7"), errors.get(0).getMessage());
+        assertEquals("broker unavailable", errors.get(0).getCause().getCause().getMessage());
+        assertInstanceOf(IllegalStateException.class, errors.get(1));
     }
 
     @Test
@@ -547,8 +548,9 @@ class KafkaConsumerTest {
 
         verify(consumer, never()).commitSync(any(Map.class));
         verify(consumer).seek(TP, 7L);
-        assertEquals(2, errors.size()); // the handler's own error + the DLQ write failure
-        assertTrue(errors.get(1).getMessage().contains("rewound to offset 7"), errors.get(1).getMessage());
+        assertEquals(2, errors.size()); // settlement failure first, then the handler's own error (settle, then report)
+        assertTrue(errors.get(0).getMessage().contains("rewound to offset 7"), errors.get(0).getMessage());
+        assertInstanceOf(IllegalStateException.class, errors.get(1));
     }
 
     @Test
@@ -653,8 +655,137 @@ class KafkaConsumerTest {
             .onError((e, env, r) -> { if (e instanceof BabelQueueException) { throw new IllegalArgumentException("onError blew up"); } })
             .build();
 
-        assertThrows(IllegalArgumentException.class, worker::poll);
+        worker.poll(); // a throwing onError is swallowed
         verify(consumer).seek(TP, 7L);
+        verify(consumer, never()).commitSync(any(Map.class));
+    }
+
+    // -- a throwing onError must never bypass settlement on the report-capable paths ----------------------
+
+    @Test
+    void nonJsonBodyRejectedByConformanceCheckWithThrowingOnErrorStillParksAndCommits() {
+        ConsumerRecord<byte[], byte[]> rec = rawRecord("not-json".getBytes(StandardCharsets.UTF_8), 4);
+        Consumer<byte[], byte[]> consumer = consumerWith(rec);
+        MockProducer<byte[], byte[]> producer = producer();
+
+        KafkaConsumer.builder(consumer)
+            .producer(producer).retryTopics(topology())
+            .onError((e, env, r) -> { throw new IllegalArgumentException("onError blew up"); })
+            .build()
+            .poll();
+
+        assertEquals("orders.dlq", producer.history().get(0).topic());
+        verify(consumer).commitSync(Map.of(TP, new OffsetAndMetadata(5)));
+        verify(consumer, never()).seek(any(TopicPartition.class), org.mockito.ArgumentMatchers.anyLong());
+    }
+
+    @Test
+    void decodeThrowingWithThrowingOnErrorStillParksTheRawRecordAndCommits() {
+        // EnvelopeCodec.decode returns an empty envelope for non-JSON instead of throwing, so the decode-catch
+        // branch is forced here by making decode itself fail.
+        byte[] body = "{}".getBytes(StandardCharsets.UTF_8);
+        ConsumerRecord<byte[], byte[]> rec = rawRecord(body, 4);
+        Consumer<byte[], byte[]> consumer = consumerWith(rec);
+        MockProducer<byte[], byte[]> producer = producer();
+
+        try (org.mockito.MockedStatic<com.babelqueue.EnvelopeCodec> codec =
+                 org.mockito.Mockito.mockStatic(com.babelqueue.EnvelopeCodec.class, org.mockito.Mockito.CALLS_REAL_METHODS)) {
+            codec.when(() -> com.babelqueue.EnvelopeCodec.decode(org.mockito.ArgumentMatchers.anyString()))
+                .thenThrow(new IllegalStateException("decode exploded"));
+
+            KafkaConsumer.builder(consumer)
+                .producer(producer).retryTopics(topology())
+                .onError((e, env, r) -> { throw new IllegalArgumentException("onError blew up"); })
+                .build()
+                .poll();
+        }
+
+        assertEquals(1, producer.history().size());
+        assertEquals("orders.dlq", producer.history().get(0).topic());
+        org.junit.jupiter.api.Assertions.assertArrayEquals(body, producer.history().get(0).value());
+        verify(consumer).commitSync(Map.of(TP, new OffsetAndMetadata(5)));
+        verify(consumer, never()).seek(any(TopicPartition.class), org.mockito.ArgumentMatchers.anyLong());
+    }
+
+    @Test
+    void nonConformantEnvelopeWithThrowingOnErrorStillParksAndCommits() {
+        Envelope base = envelope(0);
+        Envelope nonConformant = new Envelope(base.job(), "", base.data(), base.meta(), 0, base.deadLetter()); // blank trace_id
+        Consumer<byte[], byte[]> consumer = consumerWith(recordFor(nonConformant, 12));
+        MockProducer<byte[], byte[]> producer = producer();
+        int[] handled = {0};
+
+        KafkaConsumer.builder(consumer)
+            .producer(producer).retryTopics(topology())
+            .handler(URN, (env, r) -> handled[0]++)
+            .onError((e, env, r) -> { throw new IllegalArgumentException("onError blew up"); })
+            .build()
+            .poll();
+
+        assertEquals(0, handled[0]);
+        assertEquals("orders.dlq", producer.history().get(0).topic());
+        verify(consumer).commitSync(Map.of(TP, new OffsetAndMetadata(13)));
+        verify(consumer, never()).seek(any(TopicPartition.class), org.mockito.ArgumentMatchers.anyLong());
+    }
+
+    @Test
+    void nonConformantEnvelopeDlqFailureWithThrowingOnErrorStillRewinds() {
+        Envelope base = envelope(0);
+        Envelope nonConformant = new Envelope(base.job(), "", base.data(), base.meta(), 0, base.deadLetter());
+        Consumer<byte[], byte[]> consumer = consumerWith(recordFor(nonConformant, 12));
+
+        KafkaConsumer.builder(consumer)
+            .producer(failingProducer()).retryTopics(topology())
+            .onError((e, env, r) -> { throw new IllegalArgumentException("onError blew up"); })
+            .build()
+            .poll();
+
+        verify(consumer).seek(TP, 12L);
+        verify(consumer, never()).commitSync(any(Map.class));
+    }
+
+    @Test
+    void throwingHandlerWithThrowingOnErrorStillRepublishesToRetryAndCommits() {
+        Consumer<byte[], byte[]> consumer = consumerWith(recordFor(envelope(0), 10));
+        MockProducer<byte[], byte[]> producer = producer();
+
+        KafkaConsumer.builder(consumer)
+            .producer(producer).retryTopics(topology()).maxTries(3)
+            .handler(URN, (env, r) -> { throw new IllegalStateException("boom"); })
+            .onError((e, env, r) -> { throw new IllegalArgumentException("onError blew up"); })
+            .build()
+            .poll();
+
+        assertEquals("orders.retry.1", producer.history().get(0).topic());
+        verify(consumer).commitSync(Map.of(TP, new OffsetAndMetadata(11)));
+        verify(consumer, never()).seek(any(TopicPartition.class), org.mockito.ArgumentMatchers.anyLong());
+    }
+
+    @Test
+    void exhaustedHandlerWithThrowingOnErrorStillDeadLettersAndCommits() {
+        Consumer<byte[], byte[]> consumer = consumerWith(recordFor(envelope(2), 7));
+        MockProducer<byte[], byte[]> producer = producer();
+
+        KafkaConsumer.builder(consumer)
+            .producer(producer).retryTopics(topology()).maxTries(3)
+            .handler(URN, (env, r) -> { throw new IllegalStateException("boom"); })
+            .onError((e, env, r) -> { throw new IllegalArgumentException("onError blew up"); })
+            .build()
+            .poll();
+
+        assertEquals("orders.dlq", producer.history().get(0).topic());
+        verify(consumer).commitSync(Map.of(TP, new OffsetAndMetadata(8)));
+    }
+
+    @Test
+    void unknownUrnFailWithThrowingOnErrorStillRaisesUnknownUrn() {
+        Consumer<byte[], byte[]> consumer = consumerWith(recordFor(envelope(0), 3));
+
+        KafkaConsumer worker = KafkaConsumer.builder(consumer)
+            .onError((e, env, r) -> { throw new IllegalArgumentException("onError blew up"); })
+            .build();
+
+        assertThrows(UnknownUrnException.class, worker::poll);
         verify(consumer, never()).commitSync(any(Map.class));
     }
 }

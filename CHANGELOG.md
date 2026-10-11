@@ -9,6 +9,17 @@ The envelope wire format is versioned separately by `meta.schema_version`
 
 ## [Unreleased]
 
+### Fixed
+
+- `KafkaConsumer` no longer lets a throwing `onError` callback bypass settlement. Previously `onError` ran
+  *before* the raw DLQ write + commit on the undecodable-body and non-conformant-envelope paths, and before the
+  retry republish / DLQ write + commit on the handler-failure path, so a throwing callback skipped the settlement and
+  the record was redelivered forever. These paths now settle first and report afterwards (also when settling fails),
+  and `report()` swallows callback exceptions, so the commit / seek-back already performed stands and the poll loop
+  keeps running. Behaviour note: a throwing `onError` on the schema-version-gate and rewind paths is now swallowed
+  instead of propagating out of `poll()`. No public API change; the envelope, the `dead_letter` block and the
+  headers are unchanged (`schema_version` stays 1). Patch-level behaviour fix.
+
 ## [1.0.4] - 2026-10-11
 
 ### Fixed

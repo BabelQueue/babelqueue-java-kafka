@@ -146,16 +146,25 @@ public final class KafkaConsumer {
         try {
             envelope = reconcile(EnvelopeCodec.decode(value(record)), record);
         } catch (RuntimeException decodeError) {
-            // Undecodable / poison body — cannot annotate; report and DLQ the raw record.
-            report(decodeError, null, record);
-            return settle(record, null, () -> deadLetterRawConfirmed(record), "dead-letter an undecodable record");
+            // Undecodable / poison body — cannot annotate; DLQ the raw record. Settle first, report afterwards
+            // (also when settling throws), so a throwing onError can never bypass the DLQ write / commit.
+            try {
+                return settle(record, null, () -> deadLetterRawConfirmed(record), "dead-letter an undecodable record");
+            } finally {
+                report(decodeError, null, record);
+            }
         }
 
         if (!EnvelopeCodec.accepts(envelope)) {
-            report(new BabelQueueException("Rejected a non-conformant BabelQueue envelope from Kafka."),
-                envelope, record);
-            return settle(record, envelope, () -> deadLetter(envelope, record, "poison", null),
-                "dead-letter a non-conformant envelope");
+            // Settle first, report afterwards (also when settling throws), as above.
+            BabelQueueException rejected =
+                new BabelQueueException("Rejected a non-conformant BabelQueue envelope from Kafka.");
+            try {
+                return settle(record, envelope, () -> deadLetter(envelope, record, "poison", null),
+                    "dead-letter a non-conformant envelope");
+            } finally {
+                report(rejected, envelope, record);
+            }
         }
 
         String urn = urn(record, envelope);
@@ -168,9 +177,14 @@ public final class KafkaConsumer {
             handler.handle(envelope, record);
             commit(record);
         } catch (Exception error) {
-            report(error, envelope, record);
-            return settle(record, envelope, () -> retryOrDeadLetter(record, envelope, error),
-                "republish a failed record to its retry tier / DLQ");
+            // Settle first, report afterwards (also when settling throws): a throwing onError must never
+            // bypass the retry republish / DLQ write / commit.
+            try {
+                return settle(record, envelope, () -> retryOrDeadLetter(record, envelope, error),
+                    "republish a failed record to its retry tier / DLQ");
+            } finally {
+                report(error, envelope, record);
+            }
         }
         return true;
     }
@@ -365,9 +379,18 @@ public final class KafkaConsumer {
         }
     }
 
+    /**
+     * Invokes {@code onError} where it must not be able to disturb settlement: a throwing callback is swallowed
+     * (there is no safer sink than the consumer itself), so the commit / seek-back already performed stands and
+     * the poll loop keeps running.
+     */
     private void report(Throwable error, Envelope envelope, ConsumerRecord<byte[], byte[]> record) {
         if (onError != null) {
-            onError.onError(error, envelope, record);
+            try {
+                onError.onError(error, envelope, record);
+            } catch (RuntimeException ignored) {
+                // A misbehaving observer must not bypass the commit / seek-back.
+            }
         }
     }
 
