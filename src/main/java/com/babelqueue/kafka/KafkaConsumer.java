@@ -268,7 +268,7 @@ public final class KafkaConsumer {
         headers.add(KafkaHeaders.header(KafkaHeaders.DELAY, Long.toString(tier.delay().toMillis())));
         headers.add(KafkaHeaders.header(KafkaHeaders.ORIGINAL_TOPIC, originalTopic(record)));
         // The retry-topic consumer waits until record.timestamp + tier, so timestamp = re-entry time.
-        send(tier.topic(), bumped, headers, System.currentTimeMillis());
+        send(tier.topic(), record.key(), bumped, headers, System.currentTimeMillis());
     }
 
     private void deadLetter(Envelope envelope, ConsumerRecord<byte[], byte[]> record, String reason, Throwable error)
@@ -283,7 +283,7 @@ public final class KafkaConsumer {
             error == null ? null : error.getClass().getName());
         List<Header> headers = KafkaHeaders.of(annotated);
         headers.add(KafkaHeaders.header(KafkaHeaders.ORIGINAL_TOPIC, originalTopic(record)));
-        send(dlq, annotated, headers, System.currentTimeMillis());
+        send(dlq, record.key(), annotated, headers, System.currentTimeMillis());
     }
 
     /**
@@ -301,11 +301,16 @@ public final class KafkaConsumer {
             record.value(), record.headers())).get();
     }
 
-    /** Send and wait for the broker's acknowledgement; a failure surfaces so the caller never commits past it. */
-    private void send(String topic, Envelope envelope, List<Header> headers, long timestamp) throws Exception {
+    /**
+     * Send and wait for the broker's acknowledgement; a failure surfaces so the caller never commits past it. The
+     * original record {@code key} is carried unchanged (a null key stays null, an empty key stays empty, none is
+     * synthesised) so a keyed stream keeps its key across retry tiers and the DLQ.
+     */
+    private void send(String topic, byte[] key, Envelope envelope, List<Header> headers, long timestamp)
+        throws Exception {
         requireProducer();
         byte[] value = EnvelopeCodec.encode(envelope).getBytes(StandardCharsets.UTF_8);
-        producer.send(new ProducerRecord<>(topic, null, timestamp, null, value, headers)).get();
+        producer.send(new ProducerRecord<>(topic, null, timestamp, key, value, headers)).get();
     }
 
     // -- helpers ----------------------------------------------------------------------------

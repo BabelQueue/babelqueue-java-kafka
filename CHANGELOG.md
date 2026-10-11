@@ -9,6 +9,14 @@ The envelope wire format is versioned separately by `meta.schema_version`
 
 ## [Unreleased]
 
+### Fixed
+
+- The original Kafka record key is now preserved when the consumer republishes a record: the retry-tier write, the
+  unknown-URN release, and the envelope DLQ write all carried a
+  `null` key before. A null key stays null, an empty key stays empty and no key is synthesised; the raw/poison DLQ
+  already kept it. Partition equality is not guaranteed. The envelope, the `dead_letter` block and the headers are
+  unchanged (`schema_version` stays 1). Patch-level behaviour fix.
+
 ## [1.0.3] - 2026-10-11
 
 ### Fixed
