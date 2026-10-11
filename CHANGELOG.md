@@ -7,6 +7,20 @@ this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 The envelope wire format is versioned separately by `meta.schema_version`
 (currently **1**) — see the contract at [babelqueue.com](https://babelqueue.com).
 
+## [Unreleased]
+
+### Fixed
+
+- `KafkaRedriveTransport` now implements `Redrive.Rewinder`: whenever `Redrive.redrive` stops on a failed
+  message (a failed restore write back to the DLQ, a failed redrive write, a throwing `select`, a failed
+  ack), the consumer is `seek`-ed back to the first unacknowledged record of every partition it has handed
+  out in the batch (`Redrive.redrive` pops the whole batch before processing it), so a later cumulative
+  commit can no longer skip any of them. A failing `seek` does not stop the others (every partition is
+  attempted) and is reported together with the original error. An acknowledged record is never rewound:
+  after a failed redrive write whose restore succeeded, only the rest of the batch is (the next record in
+  the same partition resumes right after it). Requires a `babelqueue-core` that provides
+  `Redrive.Rewinder`.
+
 ## [1.1.0] - 2026-10-11
 
 ### Added

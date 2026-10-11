@@ -14,6 +14,8 @@ import com.babelqueue.Envelope;
 import com.babelqueue.EnvelopeCodec;
 import com.babelqueue.Redrive;
 import java.nio.charset.StandardCharsets;
+import java.util.ArrayList;
+import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
@@ -175,6 +177,282 @@ class KafkaRedriveTransportTest {
             failer.join();
         }
         verify(consumer, org.mockito.Mockito.never()).commitSync(any(Map.class));
+    }
+
+    @Test
+    void failedRestoreRewindsTheConsumerToTheRecordAndNeverCommits() throws Exception {
+        Consumer<byte[], byte[]> consumer = consumerWith(dlqRecord(KEYED, dlqValue()));
+        MockProducer<byte[], byte[]> producer = new MockProducer<>(false, new ByteArraySerializer(), new ByteArraySerializer());
+        KafkaRedriveTransport transport = new KafkaRedriveTransport(consumer, producer);
+
+        // A dry run restores the record to the DLQ; the broker refuses that write.
+        Thread failer = failEveryWrite(producer);
+        try {
+            org.junit.jupiter.api.Assertions.assertThrows(Exception.class,
+                () -> Redrive.redrive(transport, "orders.dlq", Redrive.Options.all().dryRun(true)));
+        } finally {
+            failer.interrupt();
+            failer.join();
+        }
+
+        verify(consumer).seek(TP, 41L);
+        verify(consumer, org.mockito.Mockito.never()).commitSync(any(Map.class));
+    }
+
+    @Test
+    void failedRedriveWriteAndFailedRestoreRewindAndReportBothErrors() throws Exception {
+        Consumer<byte[], byte[]> consumer = consumerWith(dlqRecord(KEYED, dlqValue()));
+        MockProducer<byte[], byte[]> producer = new MockProducer<>(false, new ByteArraySerializer(), new ByteArraySerializer());
+        KafkaRedriveTransport transport = new KafkaRedriveTransport(consumer, producer);
+
+        Thread failer = failEveryWrite(producer);
+        Exception thrown;
+        try {
+            thrown = org.junit.jupiter.api.Assertions.assertThrows(Exception.class,
+                () -> Redrive.redrive(transport, "orders.dlq", Redrive.Options.all()));
+        } finally {
+            failer.interrupt();
+            failer.join();
+        }
+
+        assertEquals(1, thrown.getSuppressed().length, "the redrive-write failure rides along on the restore error");
+        verify(consumer).seek(TP, 41L);
+        verify(consumer, org.mockito.Mockito.never()).commitSync(any(Map.class));
+    }
+
+    @Test
+    void failedRewindIsReportedAlongsideTheRestoreError() throws Exception {
+        Consumer<byte[], byte[]> consumer = consumerWith(dlqRecord(KEYED, dlqValue()));
+        org.mockito.Mockito.doThrow(new IllegalStateException("seek failed")).when(consumer).seek(any(TopicPartition.class), org.mockito.ArgumentMatchers.anyLong());
+        MockProducer<byte[], byte[]> producer = new MockProducer<>(false, new ByteArraySerializer(), new ByteArraySerializer());
+        KafkaRedriveTransport transport = new KafkaRedriveTransport(consumer, producer);
+
+        Thread failer = failEveryWrite(producer);
+        Exception thrown;
+        try {
+            thrown = org.junit.jupiter.api.Assertions.assertThrows(Exception.class,
+                () -> Redrive.redrive(transport, "orders.dlq", Redrive.Options.all().dryRun(true)));
+        } finally {
+            failer.interrupt();
+            failer.join();
+        }
+
+        assertEquals(1, thrown.getSuppressed().length);
+        assertEquals("seek failed", thrown.getSuppressed()[0].getMessage());
+        verify(consumer, org.mockito.Mockito.never()).commitSync(any(Map.class));
+    }
+
+    private static ConsumerRecord<byte[], byte[]> dlqRecordAt(int partition, long offset) {
+        return new ConsumerRecord<>("orders.dlq", partition, offset, 0L, TimestampType.CREATE_TIME,
+            -1, -1, KEYED, dlqValue(), new RecordHeaders(), Optional.empty());
+    }
+
+    /** A consumer whose first poll returns the given records (partition order fixed) and later polls are empty. */
+    private static Consumer<byte[], byte[]> consumerPolling(List<ConsumerRecord<byte[], byte[]>> records) {
+        // LinkedHashMap, not Map.of: the poll result's partition order decides the pop order and must be stable.
+        Map<TopicPartition, List<ConsumerRecord<byte[], byte[]>>> byPartition = new LinkedHashMap<>();
+        for (ConsumerRecord<byte[], byte[]> record : records) {
+            byPartition.computeIfAbsent(new TopicPartition(record.topic(), record.partition()), k -> new ArrayList<>())
+                .add(record);
+        }
+        @SuppressWarnings("unchecked")
+        Consumer<byte[], byte[]> consumer = mock(Consumer.class);
+        when(consumer.poll(any(java.time.Duration.class)))
+            .thenReturn(new ConsumerRecords<>(byPartition))
+            .thenReturn(ConsumerRecords.empty());
+        return consumer;
+    }
+
+    @Test
+    void rewindSeeksEveryPartitionBackToItsFirstUnacknowledgedRecord() {
+        TopicPartition other = new TopicPartition("orders.dlq", 1);
+        Consumer<byte[], byte[]> consumer = consumerPolling(
+            List.of(dlqRecordAt(0, 41), dlqRecordAt(0, 42), dlqRecordAt(1, 9)));
+        KafkaRedriveTransport transport = new KafkaRedriveTransport(consumer, producer());
+
+        // The whole batch is popped before it is processed, so the consumer is already past all three records.
+        Redrive.Reserved first = transport.pop("orders.dlq");
+        transport.pop("orders.dlq");
+        transport.pop("orders.dlq");
+        assertEquals(41L, ((ConsumerRecord<?, ?>) first.handle()).offset());
+        transport.rewind(first);
+
+        verify(consumer).seek(TP, 41L);
+        verify(consumer).seek(other, 9L);
+        verify(consumer, org.mockito.Mockito.never()).commitSync(any(Map.class));
+        // The buffer was dropped: the next pop re-polls instead of handing out a stale record.
+        assertNull(transport.pop("orders.dlq"));
+    }
+
+    @Test
+    void rewindLeavesAlreadyAcknowledgedRecordsAlone() {
+        TopicPartition other = new TopicPartition("orders.dlq", 1);
+        Consumer<byte[], byte[]> consumer = consumerPolling(
+            List.of(dlqRecordAt(0, 41), dlqRecordAt(0, 42), dlqRecordAt(1, 9)));
+        KafkaRedriveTransport transport = new KafkaRedriveTransport(consumer, producer());
+
+        Redrive.Reserved first = transport.pop("orders.dlq");
+        Redrive.Reserved second = transport.pop("orders.dlq");
+        transport.pop("orders.dlq");
+        transport.ack(first);
+        transport.rewind(second);
+
+        verify(consumer).seek(TP, 42L);
+        verify(consumer).seek(other, 9L);
+        verify(consumer, org.mockito.Mockito.never()).seek(TP, 41L);
+    }
+
+    @Test
+    void failedRestoreInAMultiPartitionBatchRewindsEveryPartition() throws Exception {
+        TopicPartition other = new TopicPartition("orders.dlq", 1);
+        Consumer<byte[], byte[]> consumer = consumerPolling(List.of(dlqRecordAt(0, 41), dlqRecordAt(1, 9)));
+        MockProducer<byte[], byte[]> producer = new MockProducer<>(false, new ByteArraySerializer(), new ByteArraySerializer());
+        KafkaRedriveTransport transport = new KafkaRedriveTransport(consumer, producer);
+
+        Thread failer = failEveryWrite(producer);
+        try {
+            org.junit.jupiter.api.Assertions.assertThrows(Exception.class,
+                () -> Redrive.redrive(transport, "orders.dlq", Redrive.Options.all().dryRun(true)));
+        } finally {
+            failer.interrupt();
+            failer.join();
+        }
+
+        // The partition-1 record was popped but never processed: it must be rewound too, not just the failed one.
+        verify(consumer).seek(TP, 41L);
+        verify(consumer).seek(other, 9L);
+        verify(consumer, org.mockito.Mockito.never()).commitSync(any(Map.class));
+    }
+
+    @Test
+    void rewindOfAnAcknowledgedSoleRecordSeeksNothing() {
+        Consumer<byte[], byte[]> consumer = consumerPolling(List.of(dlqRecordAt(0, 41)));
+        KafkaRedriveTransport transport = new KafkaRedriveTransport(consumer, producer());
+
+        Redrive.Reserved only = transport.pop("orders.dlq");
+        transport.ack(only);
+        transport.rewind(only);
+
+        // Nothing is outstanding: seeking the acked partition back would redeliver (duplicate) the record.
+        verify(consumer, org.mockito.Mockito.never()).seek(any(TopicPartition.class), org.mockito.ArgumentMatchers.anyLong());
+    }
+
+    @Test
+    void rewindOfAnAcknowledgedRecordResumesRightAfterItInTheSamePartition() {
+        Consumer<byte[], byte[]> consumer = consumerPolling(List.of(dlqRecordAt(0, 41), dlqRecordAt(0, 42), dlqRecordAt(0, 43)));
+        KafkaRedriveTransport transport = new KafkaRedriveTransport(consumer, producer());
+
+        Redrive.Reserved first = transport.pop("orders.dlq");
+        transport.pop("orders.dlq");
+        transport.pop("orders.dlq");
+        transport.ack(first);
+        transport.rewind(first);
+
+        // 41 is acknowledged (committed up to 42): the partition resumes at 42, never at 41 (a duplicate).
+        verify(consumer).seek(TP, 42L);
+        verify(consumer, org.mockito.Mockito.never()).seek(TP, 41L);
+    }
+
+    @Test
+    void rewindAttemptsEverySeekEvenWhenOneFails() {
+        TopicPartition other = new TopicPartition("orders.dlq", 1);
+        Consumer<byte[], byte[]> consumer = consumerPolling(List.of(dlqRecordAt(0, 41), dlqRecordAt(1, 9)));
+        RuntimeException seekFailure = new IllegalStateException("seek refused");
+        org.mockito.Mockito.doThrow(seekFailure).when(consumer).seek(TP, 41L);
+        KafkaRedriveTransport transport = new KafkaRedriveTransport(consumer, producer());
+
+        Redrive.Reserved first = transport.pop("orders.dlq");
+        transport.pop("orders.dlq");
+
+        RuntimeException thrown = org.junit.jupiter.api.Assertions.assertThrows(RuntimeException.class,
+            () -> transport.rewind(first));
+
+        assertEquals(seekFailure, thrown);
+        // The failing first partition did not stop the second one from being rewound.
+        verify(consumer).seek(other, 9L);
+    }
+
+    @Test
+    void rewindReportsEverySeekFailureNotOnlyTheFirst() {
+        TopicPartition other = new TopicPartition("orders.dlq", 1);
+        Consumer<byte[], byte[]> consumer = consumerPolling(List.of(dlqRecordAt(0, 41), dlqRecordAt(1, 9)));
+        RuntimeException first = new IllegalStateException("seek p0 refused");
+        RuntimeException second = new IllegalStateException("seek p1 refused");
+        org.mockito.Mockito.doThrow(first).when(consumer).seek(TP, 41L);
+        org.mockito.Mockito.doThrow(second).when(consumer).seek(other, 9L);
+        KafkaRedriveTransport transport = new KafkaRedriveTransport(consumer, producer());
+
+        Redrive.Reserved reserved = transport.pop("orders.dlq");
+        transport.pop("orders.dlq");
+
+        RuntimeException thrown = org.junit.jupiter.api.Assertions.assertThrows(RuntimeException.class,
+            () -> transport.rewind(reserved));
+
+        assertEquals(first, thrown);
+        assertEquals(List.of(second), List.of(thrown.getSuppressed()));
+    }
+
+    @Test
+    void failedWorkWriteWithASuccessfulRestoreRewindsTheRestButNotTheAcknowledgedRecord() throws Exception {
+        TopicPartition other = new TopicPartition("orders.dlq", 1);
+        Consumer<byte[], byte[]> consumer = consumerPolling(List.of(dlqRecordAt(0, 41), dlqRecordAt(1, 9)));
+        MockProducer<byte[], byte[]> producer = new MockProducer<>(false, new ByteArraySerializer(), new ByteArraySerializer());
+        KafkaRedriveTransport transport = new KafkaRedriveTransport(consumer, producer);
+
+        // The work-topic write fails, the restore to the DLQ succeeds.
+        Thread failer = failWritesExcept(producer, "orders.dlq");
+        try {
+            org.junit.jupiter.api.Assertions.assertThrows(Exception.class,
+                () -> Redrive.redrive(transport, "orders.dlq", Redrive.Options.all()));
+        } finally {
+            failer.interrupt();
+            failer.join();
+        }
+
+        // The first record was restored and acked: committed once, never sought back (that would duplicate it).
+        verify(consumer).commitSync(Map.of(TP, new OffsetAndMetadata(42L)));
+        verify(consumer, org.mockito.Mockito.never()).seek(TP, 41L);
+        // The run stopped, so the popped-but-unprocessed partition-1 record is handed back.
+        verify(consumer).seek(other, 9L);
+    }
+
+    /** Fails producer writes to every topic except {@code okTopic}, which succeed, until interrupted. */
+    private static Thread failWritesExcept(MockProducer<byte[], byte[]> producer, String okTopic) {
+        Thread failer = new Thread(() -> {
+            int handled = 0;
+            while (!Thread.currentThread().isInterrupted()) {
+                if (producer.history().size() > handled) {
+                    ProducerRecord<byte[], byte[]> sent = producer.history().get(handled);
+                    handled++;
+                    if (okTopic.equals(sent.topic())) {
+                        producer.completeNext();
+                    } else {
+                        producer.errorNext(new RuntimeException("broker down"));
+                    }
+                } else {
+                    Thread.onSpinWait();
+                }
+            }
+        });
+        failer.start();
+        return failer;
+    }
+
+    /** Fails each producer write as soon as it is issued, until interrupted. */
+    private static Thread failEveryWrite(MockProducer<byte[], byte[]> producer) {
+        Thread failer = new Thread(() -> {
+            int handled = 0;
+            while (!Thread.currentThread().isInterrupted()) {
+                if (producer.history().size() > handled) {
+                    handled++;
+                    producer.errorNext(new RuntimeException("broker down"));
+                } else {
+                    Thread.onSpinWait();
+                }
+            }
+        });
+        failer.start();
+        return failer;
     }
 
     @Test

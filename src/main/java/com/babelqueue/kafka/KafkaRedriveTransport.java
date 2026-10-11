@@ -10,9 +10,14 @@ import java.nio.charset.StandardCharsets;
 import java.time.Duration;
 import java.util.ArrayDeque;
 import java.util.Deque;
+import java.util.Collections;
+import java.util.Comparator;
+import java.util.IdentityHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Objects;
+import java.util.Set;
+import java.util.TreeMap;
 import org.apache.kafka.clients.consumer.Consumer;
 import org.apache.kafka.clients.consumer.ConsumerRecord;
 import org.apache.kafka.clients.consumer.OffsetAndMetadata;
@@ -44,13 +49,26 @@ import org.apache.kafka.common.header.Header;
  * published (a decodable envelope only), so the redriven record carries the reset {@code attempts} and no stale
  * {@code dead_letter} metadata. The {@code bypass} option's {@code bq-replay-bypass} header is not propagated
  * by this transport.
+ *
+ * <p>It also implements {@link Redrive.Rewinder}: when an exception stops the run (the restore write
+ * itself failed, a redrive write failed, the {@code select} predicate threw, or an {@code ack} failed),
+ * {@link Redrive} asks {@link #rewind} to {@code seek} the consumer back. {@link Redrive} pops the whole
+ * batch before processing it, so the consumer position has already moved past every record handed out and
+ * not yet acknowledged; {@link #rewind} therefore seeks <b>every</b> partition back to its first such record
+ * (and drops the poll buffer), so a later cumulative commit cannot skip a record that was not safely
+ * restored. A record that was already restored and acknowledged is left alone (no copy is redelivered) and
+ * only the rest of the batch is sought back. Every partition is attempted even if one {@code seek} fails;
+ * the failures are reported together.
  */
-public final class KafkaRedriveTransport implements Redrive.Transport, Redrive.KeyedRepublisher {
+public final class KafkaRedriveTransport
+    implements Redrive.Transport, Redrive.KeyedRepublisher, Redrive.Rewinder {
 
     private final Consumer<byte[], byte[]> consumer;
     private final Producer<byte[], byte[]> producer;
     private final Duration pollTimeout;
     private final Deque<ConsumerRecord<byte[], byte[]>> buffer = new ArrayDeque<>();
+    /** Records handed out by {@link #pop} and not yet acknowledged; the consumer position is already past them. */
+    private final Set<ConsumerRecord<byte[], byte[]>> inFlight = Collections.newSetFromMap(new IdentityHashMap<>());
 
     /** A redrive transport that polls the DLQ with a 1 second timeout. */
     public KafkaRedriveTransport(Consumer<byte[], byte[]> consumer, Producer<byte[], byte[]> producer) {
@@ -80,6 +98,7 @@ public final class KafkaRedriveTransport implements Redrive.Transport, Redrive.K
         // record. An unreadable (invalid UTF-8) or null value is handed out as an empty body, which Redrive treats
         // as undecodable and restores - and publishFrom then re-writes the ORIGINAL bytes, not this body.
         String body = decodeStrict(next.value());
+        inFlight.add(next);
         return new Redrive.Reserved(body == null ? "" : body, next);
     }
 
@@ -103,6 +122,45 @@ public final class KafkaRedriveTransport implements Redrive.Transport, Redrive.K
         ConsumerRecord<byte[], byte[]> record = record(message);
         TopicPartition tp = new TopicPartition(record.topic(), record.partition());
         consumer.commitSync(Map.of(tp, new OffsetAndMetadata(record.offset() + 1)));
+        inFlight.remove(record);
+    }
+
+    @Override
+    public void rewind(Redrive.Reserved message) {
+        // The consumer position is already past every record handed out (pop drains the whole batch before it is
+        // processed) and past the ones still buffered. Seek each affected partition back to its first record that
+        // is not acknowledged, so no later commit - cumulative per partition - can skip any of them. The record
+        // behind `message` counts only while it is unacknowledged (it is in inFlight): a record that was restored
+        // and acknowledged has already been committed past, and rewinding to it would redeliver a copy.
+        // Sorted by topic then partition: inFlight is an identity set with no iteration order, and the seeks
+        // (and so any reported failures) should be deterministic.
+        Map<TopicPartition, Long> positions = new TreeMap<>(
+            Comparator.comparing(TopicPartition::topic).thenComparingInt(TopicPartition::partition));
+        for (ConsumerRecord<byte[], byte[]> pending : inFlight) {
+            positions.merge(new TopicPartition(pending.topic(), pending.partition()), pending.offset(), Math::min);
+        }
+        for (ConsumerRecord<byte[], byte[]> buffered : buffer) {
+            positions.merge(new TopicPartition(buffered.topic(), buffered.partition()), buffered.offset(), Math::min);
+        }
+        inFlight.clear();
+        buffer.clear();
+        // One failing seek (for example a partition revoked by a rebalance) must not leave the others unrewound:
+        // try them all, then report every failure.
+        RuntimeException failure = null;
+        for (Map.Entry<TopicPartition, Long> position : positions.entrySet()) {
+            try {
+                consumer.seek(position.getKey(), position.getValue());
+            } catch (RuntimeException seekFailure) {
+                if (failure == null) {
+                    failure = seekFailure;
+                } else {
+                    failure.addSuppressed(seekFailure);
+                }
+            }
+        }
+        if (failure != null) {
+            throw failure;
+        }
     }
 
     /** Write the DLQ record back unchanged (value bytes, headers, key) with a fresh timestamp. */
