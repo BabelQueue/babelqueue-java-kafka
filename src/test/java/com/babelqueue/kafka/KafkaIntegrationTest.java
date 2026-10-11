@@ -3,10 +3,12 @@ package com.babelqueue.kafka;
 import static org.junit.jupiter.api.Assertions.assertArrayEquals;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
+import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 import com.babelqueue.Envelope;
 import com.babelqueue.EnvelopeCodec;
+import com.babelqueue.Redrive;
 import java.nio.charset.StandardCharsets;
 import java.time.Duration;
 import java.util.ArrayList;
@@ -35,7 +37,8 @@ import org.junit.jupiter.api.condition.EnabledIfEnvironmentVariable;
  *
  * <p>Skipped in the normal suite. Enable with {@code BQ_INTEGRATION=1} and (optionally) point at a broker with
  * {@code BQ_KAFKA_BROKERS} (default {@code localhost:9092}). The CI {@code integration} job runs an
- * {@code apache/kafka} KRaft service container. Every test uses unique topic names, so the broker can be reused.
+ * {@code apache/kafka} KRaft service container. Every test uses unique topic names, so the broker can be reused. The record-key tests (§6.5) read every hop back
+ * from the broker.
  */
 @EnabledIfEnvironmentVariable(named = "BQ_INTEGRATION", matches = "1")
 class KafkaIntegrationTest {
@@ -93,6 +96,121 @@ class KafkaIntegrationTest {
             }
         }
         throw new AssertionError("no record reached " + dlq + " within " + DEADLINE);
+    }
+
+    /**
+     * Reads the first {@code count} records of {@code topic} with a plain, separate consumer (no transport logic,
+     * no shared group state) and returns them in offset order.
+     */
+    private static List<ConsumerRecord<byte[], byte[]>> readRecords(String topic, int count) {
+        List<ConsumerRecord<byte[], byte[]>> records = new ArrayList<>();
+        try (KafkaConsumer<byte[], byte[]> reader = consumer("bq-it-read-" + UUID.randomUUID(), topic)) {
+            long stop = System.nanoTime() + DEADLINE.toNanos();
+            while (records.size() < count && System.nanoTime() < stop) {
+                for (ConsumerRecord<byte[], byte[]> record : reader.poll(Duration.ofMillis(500))) {
+                    records.add(record);
+                }
+            }
+        }
+        assertTrue(records.size() >= count,
+            topic + " holds " + records.size() + " record(s), want at least " + count);
+        return records;
+    }
+
+    /** A null key stays null, an empty key stays empty and a non-empty key stays equal - never one for another. */
+    private static void assertSameKey(String hop, byte[] expected, byte[] actual) {
+        if (expected == null) {
+            assertNull(actual, hop + ": a null key must stay null");
+        } else {
+            assertNotNull(actual, hop + ": a non-null key must not become null");
+            assertArrayEquals(expected, actual, hop + ": the key must be byte-identical");
+        }
+    }
+
+    /**
+     * Contract §6.5 "Record key on republish": seeds one record with {@code key}, fails it through a retry tier into
+     * the DLQ, then redrives it (dry-run restore first, then for real onto a sandbox topic), reading every hop back
+     * from the broker and asserting its key.
+     */
+    private static void assertKeySurvivesRetryDlqAndRedrive(byte[] key) throws Exception {
+        String suffix = UUID.randomUUID().toString().substring(0, 8);
+        String work = "bq-it-key-" + suffix;
+        String sandbox = work + ".sandbox";
+        RetryTopics topology = RetryTopics.forTopic(work).tier(Duration.ofSeconds(1)).build();
+        String retry = topology.tiers().get(0).topic();
+        String dlq = topology.dlqTopic();
+        createTopics(work, retry, dlq, sandbox);
+
+        Envelope seed = EnvelopeCodec.make(URN, Map.of("order_id", 7), work, "trace-it-key");
+        byte[] body = EnvelopeCodec.encode(seed).getBytes(StandardCharsets.UTF_8);
+        AtomicInteger calls = new AtomicInteger();
+        try (KafkaProducer<byte[], byte[]> producer = producer();
+             KafkaConsumer<byte[], byte[]> rawConsumer = consumer("bq-it-group-" + suffix, work, retry)) {
+            com.babelqueue.kafka.KafkaConsumer worker = com.babelqueue.kafka.KafkaConsumer.builder(rawConsumer)
+                .producer(producer)
+                .retryTopics(topology)
+                .maxTries(2)
+                .pollTimeout(Duration.ofMillis(500))
+                .handler(URN, (envelope, record) -> {
+                    calls.incrementAndGet();
+                    throw new IllegalStateException("boom");
+                })
+                .build();
+
+            producer.send(new ProducerRecord<>(
+                work, null, seed.meta().createdAt(), key, body, KafkaHeaders.of(seed))).get();
+
+            // maxTries=2: the first failure goes to the retry tier, the second one to the DLQ.
+            long stop = System.nanoTime() + DEADLINE.toNanos();
+            while (calls.get() < 2 && System.nanoTime() < stop) {
+                worker.poll();
+            }
+            assertEquals(2, calls.get(), "handler must run once per attempt up to maxTries");
+            worker.poll(); // settle the terminal record (the DLQ write is confirmed before it returns)
+        }
+
+        assertSameKey("seeded record", key, readRecords(work, 1).get(0).key());
+        assertSameKey("retry tier republish", key, readRecords(retry, 1).get(0).key());
+        assertSameKey("DLQ write", key, readRecords(dlq, 1).get(0).key());
+
+        try (KafkaProducer<byte[], byte[]> producer = producer();
+             KafkaConsumer<byte[], byte[]> opsConsumer = consumer("bq-it-ops-" + suffix, dlq)) {
+            KafkaRedriveTransport transport =
+                new KafkaRedriveTransport(opsConsumer, producer, Duration.ofSeconds(2));
+
+            // Dry run: the record is popped and restored verbatim onto the DLQ. An empty run (group still
+            // joining) has no side effects, so it is simply repeated until it saw the record.
+            long stop = System.nanoTime() + DEADLINE.toNanos();
+            Redrive.Result dry = Redrive.redrive(transport, dlq, Redrive.Options.all().dryRun(true));
+            while (dry.items().isEmpty() && System.nanoTime() < stop) {
+                dry = Redrive.redrive(transport, dlq, Redrive.Options.all().dryRun(true));
+            }
+            assertEquals(1, dry.items().size(), "the dry run must see exactly the dead-lettered record");
+            assertSameKey("dry-run restore", key, readRecords(dlq, 2).get(1).key());
+
+            // Real redrive: drains the restored record (the group is past the original) onto the sandbox topic.
+            Redrive.Result moved = Redrive.redrive(transport, dlq, Redrive.Options.all().toQueue(sandbox));
+            while (moved.redriven() == 0 && System.nanoTime() < stop) {
+                moved = Redrive.redrive(transport, dlq, Redrive.Options.all().toQueue(sandbox));
+            }
+            assertEquals(1, moved.redriven());
+        }
+        assertSameKey("redrive", key, readRecords(sandbox, 1).get(0).key());
+    }
+
+    @Test
+    void nullRecordKeySurvivesRetryDlqAndRedrive() throws Exception {
+        assertKeySurvivesRetryDlqAndRedrive(null);
+    }
+
+    @Test
+    void emptyRecordKeySurvivesRetryDlqAndRedrive() throws Exception {
+        assertKeySurvivesRetryDlqAndRedrive(new byte[0]);
+    }
+
+    @Test
+    void nonEmptyRecordKeySurvivesRetryDlqAndRedrive() throws Exception {
+        assertKeySurvivesRetryDlqAndRedrive("order-1042".getBytes(StandardCharsets.UTF_8));
     }
 
     @Test
