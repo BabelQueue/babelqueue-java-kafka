@@ -9,6 +9,19 @@ The envelope wire format is versioned separately by `meta.schema_version`
 
 ## [Unreleased]
 
+### Added
+
+- `KafkaRedriveTransport`: a `Redrive.Transport` over Apache Kafka (a subscribed DLQ `Consumer` + a `Producer`) so
+  `Redrive.redrive` (ADR-0026) can replay `<topic>.dlq` back to the work topic, committing the DLQ offset only after
+  the re-publish is acknowledged. It implements the core's `Redrive.KeyedRepublisher`, so the redrive write and the
+  restore write back to the DLQ carry the DLQ record's key byte-for-byte (null stays null, empty stays empty, none is
+  synthesised; contract §6.5). The `bq-` headers are re-projected from the body being published. The replay-bypass
+  header is not propagated by this transport. A restore write (dry run, unselected, undecodable, failed redrive
+  write) re-writes the DLQ record verbatim: its original value bytes (a null value stays null; a value that is not
+  valid UTF-8 is never altered), headers and key, with a fresh timestamp. **Requires `babelqueue-core` 1.9.0 (the
+  MINOR after 1.8.0, which ships `Redrive.KeyedRepublisher`); `babelqueue-core.version` is pinned to it. 1.9.0 is not
+  published yet: do not push or release this module until `babelqueue-core:1.9.0` is on Maven Central.**
+
 ### Fixed
 
 - `KafkaConsumer` no longer lets a throwing `onError` callback bypass settlement. Previously `onError` ran

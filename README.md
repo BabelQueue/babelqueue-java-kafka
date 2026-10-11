@@ -99,6 +99,21 @@ is forwarded to `<topic>.dlq` (if configured) and the offset is committed.
 > the cooperative, partition-paused delay of §6.4. (A bundled re-injection runtime is a
 > near-term addition.)
 
+## Redrive (DLQ replay)
+
+`KafkaRedriveTransport` adapts a Kafka `Consumer` (subscribed to the DLQ topic, auto-commit off) and a `Producer`
+to the core's `Redrive.Transport`, so `Redrive.redrive` (ADR-0026) can replay `<topic>.dlq` back to its work topic:
+
+```java
+var transport = new KafkaRedriveTransport(dlqConsumer, producer);
+Redrive.Result result = Redrive.redrive(transport, "orders.dlq", Redrive.Options.all());
+```
+
+The DLQ record's **key is preserved byte-for-byte** on the redrive write and on the restore write back to the DLQ
+(null stays null, empty stays empty — contract §6.5). The DLQ offset is committed only after the re-publish is
+acknowledged. A restore write re-writes the DLQ record verbatim (original value bytes, headers and key), so a
+record that is not valid UTF-8 is never altered. Needs `babelqueue-core` 1.9.0 or newer (`Redrive.KeyedRepublisher`).
+
 ## Contract mapping (§6)
 
 | Envelope | Apache Kafka |
