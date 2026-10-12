@@ -112,7 +112,7 @@ Redrive.Result result = Redrive.redrive(transport, "orders.dlq", Redrive.Options
 The DLQ record's **key is preserved byte-for-byte** on the redrive write and on the restore write back to the DLQ
 (null stays null, empty stays empty — contract §6.5). The DLQ offset is committed only after the re-publish is
 acknowledged. A restore write re-writes the DLQ record verbatim (original value bytes, headers and key), so a
-record that is not valid UTF-8 is never altered. Needs `babelqueue-core` 1.9.0 or newer (`Redrive.KeyedRepublisher`).
+record that is not valid UTF-8 is never altered. Needs `babelqueue-core` 1.10.0 or newer (`Redrive.KeyedRepublisher`, `Redrive.Rewinder`).
 
 ## Contract mapping (§6)
 
