@@ -9,6 +9,8 @@ The envelope wire format is versioned separately by `meta.schema_version`
 
 ## [Unreleased]
 
+## [1.2.0] - 2026-10-12
+
 ### Changed
 
 - An undecodable (poison) body is now dead-lettered the way the Go reference does (§6.5) instead of as an
