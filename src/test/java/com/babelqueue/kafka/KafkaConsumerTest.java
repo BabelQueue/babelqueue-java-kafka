@@ -14,6 +14,7 @@ import static org.mockito.Mockito.when;
 import com.babelqueue.BabelQueueException;
 import com.babelqueue.Envelope;
 import com.babelqueue.EnvelopeCodec;
+import com.babelqueue.JsonValues;
 import com.babelqueue.UnknownUrnException;
 import com.babelqueue.UnknownUrnStrategy;
 import java.nio.charset.StandardCharsets;
@@ -190,8 +191,18 @@ class KafkaConsumerTest {
         assertEquals("unknown_urn", dead.deadLetter().reason());
     }
 
+    @SuppressWarnings("unchecked")
+    private static Map<String, Object> dlqBody(ProducerRecord<byte[], byte[]> sent) {
+        return (Map<String, Object>) JsonValues.decode(new String(sent.value(), StandardCharsets.UTF_8));
+    }
+
+    @SuppressWarnings("unchecked")
+    private static Map<String, Object> deadLetterOf(Map<String, Object> body) {
+        return (Map<String, Object>) body.get("dead_letter");
+    }
+
     @Test
-    void poisonBodyIsForwardedToDlqRaw() {
+    void poisonBodyIsWrappedAsRawWithDeadLetterBlock() {
         ConsumerRecord<byte[], byte[]> rec = rawRecord("not-json".getBytes(StandardCharsets.UTF_8), 4);
         Consumer<byte[], byte[]> consumer = consumerWith(rec);
         MockProducer<byte[], byte[]> producer = producer();
@@ -204,9 +215,106 @@ class KafkaConsumerTest {
             .poll();
 
         assertEquals(1, producer.history().size());
-        assertEquals("orders.dlq", producer.history().get(0).topic());
+        ProducerRecord<byte[], byte[]> sent = producer.history().get(0);
+        assertEquals("orders.dlq", sent.topic());
+        Map<String, Object> body = dlqBody(sent);
+        assertEquals("not-json", body.get("raw"));
+        Map<String, Object> deadLetter = deadLetterOf(body);
+        assertEquals("poison", deadLetter.get("reason"));
+        assertEquals("orders", deadLetter.get("original_queue"));
+        assertEquals("java", deadLetter.get("lang"));
+        assertEquals(0L, deadLetter.get("attempts"));
+        assertEquals(BabelQueueException.class.getName(), deadLetter.get("exception"));
+        assertEquals(reported[0].getMessage(), deadLetter.get("error"));
+        assertTrue(((Number) deadLetter.get("failed_at")).longValue() > 0);
         verify(consumer).commitSync(Map.of(TP, new OffsetAndMetadata(5)));
-        org.junit.jupiter.api.Assertions.assertNotNull(reported[0]);
+    }
+
+    @Test
+    void poisonBodyThatIsAJsonObjectKeepsItsKeys() {
+        // `data` is a list, so the envelope does not decode, but the body is still one JSON object.
+        String json = "{\"job\":\"urn:babel:orders:created\",\"trace_id\":\"t-1\",\"data\":[1,2],\"keep\":\"me\"}";
+        ConsumerRecord<byte[], byte[]> rec = rawRecord(json.getBytes(StandardCharsets.UTF_8), 4);
+        Consumer<byte[], byte[]> consumer = consumerWith(rec);
+        MockProducer<byte[], byte[]> producer = producer();
+
+        KafkaConsumer.builder(consumer)
+            .producer(producer).retryTopics(topology())
+            .handler(URN, (env, r) -> { throw new AssertionError("a poison record must never be handled"); })
+            .build()
+            .poll();
+
+        Map<String, Object> body = dlqBody(producer.history().get(0));
+        assertEquals(URN, body.get("job"));
+        assertEquals("t-1", body.get("trace_id"));
+        assertEquals(List.of(1L, 2L), body.get("data"));
+        assertEquals("me", body.get("keep"));
+        assertTrue(!body.containsKey("raw"));
+        assertEquals("poison", deadLetterOf(body).get("reason"));
+        assertEquals(URN, KafkaHeaders.string(producer.history().get(0).headers(), KafkaHeaders.JOB));
+        verify(consumer).commitSync(Map.of(TP, new OffsetAndMetadata(5)));
+    }
+
+    @Test
+    void poisonBodyThatIsNotAnObjectIsWrappedAsRaw() {
+        for (String text : new String[] {"[1,2]", "42", "", "{\"job\":\"x\"} trailing"}) {
+            MockProducer<byte[], byte[]> producer = producer();
+            KafkaConsumer.builder(consumerWith(rawRecord(text.getBytes(StandardCharsets.UTF_8), 4)))
+                .producer(producer).retryTopics(topology()).build().poll();
+            Map<String, Object> body = dlqBody(producer.history().get(0));
+            assertEquals(text, body.get("raw"), text);
+            assertEquals("poison", deadLetterOf(body).get("reason"), text);
+        }
+    }
+
+    @Test
+    void poisonBodyThatIsNotUtf8IsStoredWithReplacementCharacters() {
+        byte[] bytes = {'a', (byte) 0xFF, 'b'};
+        MockProducer<byte[], byte[]> producer = producer();
+        KafkaConsumer.builder(consumerWith(rawRecord(bytes, 4)))
+            .producer(producer).retryTopics(topology()).build().poll();
+        assertEquals("a\uFFFDb", dlqBody(producer.history().get(0)).get("raw"));
+    }
+
+    @Test
+    void poisonDeadLetterNeverProjectsAZeroSchemaVersionHeader() {
+        // No meta.schema_version → the lenient decode yields 0, which must not become `bq-schema-version: 0`
+        // (a later §6.7 gate would reject the DLQ record).
+        MockProducer<byte[], byte[]> producer = producer();
+        KafkaConsumer.builder(consumerWith(rawRecord("not-json".getBytes(StandardCharsets.UTF_8), 4)))
+            .producer(producer).retryTopics(topology()).build().poll();
+        assertNull(producer.history().get(0).headers().lastHeader(KafkaHeaders.SCHEMA_VERSION));
+    }
+
+    @Test
+    void poisonBodyWithANumberTheCodecCannotWriteBackFallsBackToRaw() {
+        // 1e400 decodes to Infinity, which cannot be written back as JSON: the body is carried verbatim as `raw`
+        // instead of producing an invalid (or failing) DLQ record.
+        String json = "{\"job\":\"x\",\"data\":[1],\"big\":1e400}";
+        MockProducer<byte[], byte[]> producer = producer();
+        KafkaConsumer.builder(consumerWith(rawRecord(json.getBytes(StandardCharsets.UTF_8), 4)))
+            .producer(producer).retryTopics(topology()).build().poll();
+        Map<String, Object> body = dlqBody(producer.history().get(0));
+        assertEquals(json, body.get("raw"));
+        assertEquals("poison", deadLetterOf(body).get("reason"));
+    }
+
+    @Test
+    void poisonDeadLetterCarriesTheAttemptsHeaderAndTheOriginalTopic() {
+        byte[] value = "not-json".getBytes(StandardCharsets.UTF_8);
+        Header[] headers = {
+            KafkaHeaders.header(KafkaHeaders.ATTEMPTS, "2"),
+            KafkaHeaders.header(KafkaHeaders.ORIGINAL_TOPIC, "billing")};
+        ConsumerRecord<byte[], byte[]> rec = new ConsumerRecord<>("orders.retry.2", 0, 4L, 0L,
+            TimestampType.CREATE_TIME, -1, value.length, null, value, new RecordHeaders(headers), Optional.empty());
+        MockProducer<byte[], byte[]> producer = producer();
+        KafkaConsumer.builder(consumerWith(rec)).producer(producer)
+            .retryTopics(RetryTopics.forTopic("billing").tier(Duration.ofSeconds(5)).tier(Duration.ofSeconds(60)).build())
+            .build().poll();
+
+        Map<String, Object> deadLetter = deadLetterOf(dlqBody(producer.history().get(0)));
+        assertEquals(2L, deadLetter.get("attempts"));
+        assertEquals("billing", deadLetter.get("original_queue"));
     }
 
     @Test
@@ -589,28 +697,6 @@ class KafkaConsumerTest {
     }
 
     @Test
-    void nonConformantEnvelopeDlqWriteFailureDoesNotCommitAndRewinds() {
-        Envelope base = envelope(0);
-        Envelope nonConformant = new Envelope(base.job(), "", base.data(), base.meta(), 0, base.deadLetter()); // blank trace_id
-        ConsumerRecord<byte[], byte[]> rec = recordFor(nonConformant, 12);
-        Consumer<byte[], byte[]> consumer = consumerWith(rec);
-        int[] handled = {0};
-        List<Throwable> errors = new ArrayList<>();
-
-        KafkaConsumer.builder(consumer)
-            .producer(failingProducer()).retryTopics(topology())
-            .handler(URN, (env, r) -> handled[0]++)
-            .onError((e, env, r) -> errors.add(e))
-            .build()
-            .poll();
-
-        assertEquals(0, handled[0]);
-        verify(consumer, never()).commitSync(any(Map.class));
-        verify(consumer).seek(TP, 12L);
-        assertEquals(2, errors.size());
-    }
-
-    @Test
     void unknownUrnDeadLetterWriteFailureDoesNotCommitAndRewinds() {
         ConsumerRecord<byte[], byte[]> rec = recordFor(envelope(0), 2);
         Consumer<byte[], byte[]> consumer = consumerWith(rec);
@@ -702,16 +788,19 @@ class KafkaConsumerTest {
 
         assertEquals(1, producer.history().size());
         assertEquals("orders.dlq", producer.history().get(0).topic());
-        org.junit.jupiter.api.Assertions.assertArrayEquals(body, producer.history().get(0).value());
+        Map<String, Object> wrapped = dlqBody(producer.history().get(0));
+        assertEquals("poison", deadLetterOf(wrapped).get("reason"));
+        assertEquals(IllegalStateException.class.getName(), deadLetterOf(wrapped).get("exception"));
+        assertEquals("decode exploded", deadLetterOf(wrapped).get("error"));
         verify(consumer).commitSync(Map.of(TP, new OffsetAndMetadata(5)));
         verify(consumer, never()).seek(any(TopicPartition.class), org.mockito.ArgumentMatchers.anyLong());
     }
 
     @Test
-    void nonConformantEnvelopeWithThrowingOnErrorStillParksAndCommits() {
-        Envelope base = envelope(0);
-        Envelope nonConformant = new Envelope(base.job(), "", base.data(), base.meta(), 0, base.deadLetter()); // blank trace_id
-        Consumer<byte[], byte[]> consumer = consumerWith(recordFor(nonConformant, 12));
+    void typedInvalidEnvelopeWithThrowingOnErrorStillParksAndCommits() {
+        // meta.id is a number: Go's typed decode rejects it, so it is poison (not a conformance-check rejection).
+        String json = "{\"job\":\"" + URN + "\",\"trace_id\":\"t\",\"data\":{},\"meta\":{\"id\":5},\"attempts\":0}";
+        Consumer<byte[], byte[]> consumer = consumerWith(rawRecord(json.getBytes(StandardCharsets.UTF_8), 12));
         MockProducer<byte[], byte[]> producer = producer();
         int[] handled = {0};
 
@@ -724,15 +813,15 @@ class KafkaConsumerTest {
 
         assertEquals(0, handled[0]);
         assertEquals("orders.dlq", producer.history().get(0).topic());
+        assertEquals("poison", deadLetterOf(dlqBody(producer.history().get(0))).get("reason"));
         verify(consumer).commitSync(Map.of(TP, new OffsetAndMetadata(13)));
         verify(consumer, never()).seek(any(TopicPartition.class), org.mockito.ArgumentMatchers.anyLong());
     }
 
     @Test
-    void nonConformantEnvelopeDlqFailureWithThrowingOnErrorStillRewinds() {
-        Envelope base = envelope(0);
-        Envelope nonConformant = new Envelope(base.job(), "", base.data(), base.meta(), 0, base.deadLetter());
-        Consumer<byte[], byte[]> consumer = consumerWith(recordFor(nonConformant, 12));
+    void typedInvalidEnvelopeDlqFailureWithThrowingOnErrorStillRewinds() {
+        String json = "{\"job\":\"" + URN + "\",\"meta\":{\"created_at\":\"2026\"}}";
+        Consumer<byte[], byte[]> consumer = consumerWith(rawRecord(json.getBytes(StandardCharsets.UTF_8), 12));
 
         KafkaConsumer.builder(consumer)
             .producer(failingProducer()).retryTopics(topology())

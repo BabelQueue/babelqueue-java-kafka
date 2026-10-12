@@ -9,6 +9,21 @@ The envelope wire format is versioned separately by `meta.schema_version`
 
 ## [Unreleased]
 
+### Changed
+
+- An undecodable (poison) body is now dead-lettered the way the Go reference does (§6.5) instead of as an
+  annotated empty envelope that lost the original body: a body that is a single JSON object keeps its keys, anything
+  else (non-JSON, a JSON scalar/array, trailing tokens, an empty value; invalid UTF-8 is stored with U+FFFD
+  substitutions) is wrapped as `{"raw": "<body>"}`, and a `dead_letter` block with `reason: "poison"` is attached
+  (`error` / `exception` from the decode failure, `original_queue` = the consumed topic, `attempts` from the
+  `bq-attempts` header, `lang: "java"`). **Behaviour change - the poison trigger set is now exactly Go's:** a record is poison when, and only when, the Go reference's typed `babelqueue.Decode` would reject it - `data` / `meta` / `dead_letter` not an object; `job`, `trace_id`, `meta.id|queue|lang` or `dead_letter.reason|error|exception|original_queue|lang` not a string; `meta.schema_version`, `meta.created_at`, `attempts` or `dead_letter.failed_at|attempts` not an integer that fits int64 (so a string such as `"2026"`, a fraction, an exponent such as `1e2`, or an out-of-range value is poison); a number in `data` that is not a finite double (`1e400`); duplicate keys are each type-checked and member names are matched exactly as spelled (case-sensitive, as the contract schema and the core decoder read them; `JOB` or `Meta` is an unknown member); and a malformed body (leading zeros, `NaN`, trailing tokens, a BOM, a second object). A JSON `null` body is not poison (empty envelope, unknown-URN path); a non-string `urn` alias is ignored. Previously only a top-level subset was checked.
+ A well-typed but non-conformant envelope (missing `data`, blank `trace_id`, a body `schema_version` other than 1) is **no longer dead-lettered** by `EnvelopeCodec.accepts`: like Go, which never calls `Accepts` on consume, it is routed by its URN to the handler (an empty URN takes the unknown-URN path).
+  The record key is carried unchanged and the offset is
+  committed only after the DLQ write is confirmed (otherwise the partition is rewound, as before). The §6.7
+  schema-version-gate rejection still forwards the record raw.
+- Poison DLQ records: a body holding a number the codec cannot write back (e.g. `1e400`) is carried verbatim as `{"raw": ...}` instead of failing the DLQ write, and `KafkaHeaders.of` no longer projects `bq-schema-version: 0` when the body has no `meta.schema_version` (a later §6.7 gate would have rejected the DLQ record). Remaining, intentional differences from the Go reference for a poison record: `dead_letter.attempts` is the `bq-attempts` header (Go writes 0) and `original_queue` is the `bq-original-topic` header when present (Go writes the consumed topic); the DLQ record also carries `bq-original-topic` plus the `bq-*` headers projected from the body (Go adds no headers); and a float literal such as `1.0` / `1e2` is re-formatted where the body is re-encoded. The wire envelope and the `dead_letter` shape are unchanged.
+- **Any decode failure is poison; the partition is never left to wedge.** The "exactly Go's" trigger set above is corrected in two respects. (1) Any `RuntimeException` **or `StackOverflowError`** from the shape scan, the codec decode or the poison wrapper is dead-lettered as poison (a deeply nested `data` previously overflowed the recursive scanner, escaped `poll`, left the offset uncommitted and locked the partition). The nesting the recursive scanner/parser carries is bounded by the thread's stack (measured at roughly 3000-5000 levels, depending on the thread's stack size), where Go allows 10000; deeper bodies are poison. (2) Member names are matched case-sensitively, exactly as the core decoder reads them (no `encoding/json`-style folding, no `equalsIgnoreCase`); the Go reference's case-insensitive read contradicts the contract schema and is tightened separately. The wire envelope and the `dead_letter` shape are unchanged.
+
 ### Fixed
 
 - `KafkaRedriveTransport` now implements `Redrive.Rewinder`: whenever `Redrive.redrive` stops on a failed

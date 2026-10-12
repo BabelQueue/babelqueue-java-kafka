@@ -153,11 +153,11 @@ class KafkaKeyPreservationTest {
     void nonConformantEnvelopeDlqKeepsKey() {
         forEachKey(key -> {
             MockProducer<byte[], byte[]> producer = producer();
-            byte[] body = "not-json".getBytes(StandardCharsets.UTF_8); // decodes leniently, fails accepts() -> "poison"
+            byte[] body = "not-json".getBytes(StandardCharsets.UTF_8); // not a JSON object -> wrapped poison record
             KafkaConsumer.builder(consumerWith(record(key, body, new Header[0])))
                 .producer(producer).retryTopics(topology()).build().poll();
             assertEquals("orders.dlq", producer.history().get(0).topic());
             return producer.history().get(0);
-        }, "envelope DLQ (poison)");
+        }, "poison DLQ (wrapped)");
     }
 }

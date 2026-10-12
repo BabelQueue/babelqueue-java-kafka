@@ -34,7 +34,10 @@ final class KafkaHeaders {
         put(headers, TRACE_ID, envelope.traceId());
         if (envelope.meta() != null) {
             put(headers, MESSAGE_ID, envelope.meta().id());
-            put(headers, SCHEMA_VERSION, Integer.toString(envelope.meta().schemaVersion()));
+            if (envelope.meta().schemaVersion() > 0) {
+                // 0 means "absent" (a lenient decode of a body without meta.schema_version); never project it.
+                put(headers, SCHEMA_VERSION, Integer.toString(envelope.meta().schemaVersion()));
+            }
             put(headers, SOURCE_LANG, envelope.meta().lang());
         }
         put(headers, ATTEMPTS, Integer.toString(envelope.attempts()));
