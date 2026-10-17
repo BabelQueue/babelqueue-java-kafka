@@ -19,7 +19,7 @@ The envelope wire format is versioned separately by `meta.schema_version`
 ### Changed
 
 - Docs only: the note in the previous release that the Go reference's case-insensitive envelope-key read "is tightened separately" is now closed — Go core 1.14.0 reads envelope keys exactly (case-sensitive, last duplicate wins), so every SDK now decides poison on the same exact-case keys.
-- Known limitation: this release resolves `babelqueue-core` 1.10.0 transitively, which predates the ADR-0031 decode behaviour (`job` + `urn` warning, closed ASCII blank set, encode-time extension-key rejection). Add `babelqueue-core` >= 1.11.0 as a direct dependency to get it; the pin will be raised in the next PATCH release.
+- The `babelqueue-core` dependency is raised to 1.11.0, so the ADR-0031 decode behaviour (`job` + `urn` warning, closed ASCII blank set) and encode-time extension-key rejection come in transitively.
 
 ## [1.2.0] - 2026-10-12
 
