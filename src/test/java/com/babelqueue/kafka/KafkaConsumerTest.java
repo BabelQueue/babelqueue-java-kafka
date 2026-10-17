@@ -145,6 +145,51 @@ class KafkaConsumerTest {
         assertEquals("failed", dead.deadLetter().reason());
     }
 
+    /** An inbound message carrying a top-level {@code extra_top} and {@code meta.vendor_flag} (ADR-0031). */
+    private static Envelope envelopeWithExtras(int attempts) {
+        return EnvelopeCodec.decode("{\"job\":\"" + URN + "\",\"trace_id\":\"trace-1\",\"data\":{\"order_id\":7},"
+            + "\"meta\":{\"id\":\"m-1\",\"queue\":\"orders\",\"lang\":\"php\",\"schema_version\":1,"
+            + "\"created_at\":1700000000000,\"vendor_flag\":true},\"attempts\":" + attempts + ",\"extra_top\":1}");
+    }
+
+    @Test
+    void retryRepublishPreservesUnknownTopLevelAndMetaKeys() {
+        MockProducer<byte[], byte[]> producer = producer();
+
+        KafkaConsumer.builder(consumerWith(recordFor(envelopeWithExtras(0), 10)))
+            .producer(producer).retryTopics(topology()).maxTries(3)
+            .handler(URN, (env, r) -> { throw new IllegalStateException("boom"); })
+            .build()
+            .poll();
+
+        ProducerRecord<byte[], byte[]> retry = producer.history().get(0);
+        assertEquals("orders.retry.1", retry.topic());
+        Envelope bumped = EnvelopeCodec.decode(new String(retry.value(), StandardCharsets.UTF_8));
+        assertEquals(1, bumped.attempts());
+        assertEquals(1L, bumped.extras().get("extra_top"));
+        assertEquals(true, bumped.meta().extras().get("vendor_flag"));
+    }
+
+    @Test
+    void deadLetterPreservesUnknownKeysAndCarriesReasonAndOriginalQueue() {
+        MockProducer<byte[], byte[]> producer = producer();
+
+        KafkaConsumer.builder(consumerWith(recordFor(envelopeWithExtras(2), 7)))
+            .producer(producer).retryTopics(topology()).maxTries(3)
+            .handler(URN, (env, r) -> { throw new IllegalStateException("boom"); })
+            .build()
+            .poll();
+
+        ProducerRecord<byte[], byte[]> dlq = producer.history().get(0);
+        assertEquals("orders.dlq", dlq.topic());
+        Envelope dead = EnvelopeCodec.decode(new String(dlq.value(), StandardCharsets.UTF_8));
+        assertEquals(1L, dead.extras().get("extra_top"));
+        assertEquals(true, dead.meta().extras().get("vendor_flag"));
+        assertEquals("failed", dead.deadLetter().reason());
+        assertEquals("orders", dead.deadLetter().originalQueue());
+        assertEquals(URN, dead.job());
+    }
+
     @Test
     void retryWithoutTopicsOrDlqRaises() {
         ConsumerRecord<byte[], byte[]> rec = recordFor(envelope(0), 1);

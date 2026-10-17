@@ -9,6 +9,12 @@ The envelope wire format is versioned separately by `meta.schema_version`
 
 ## [Unreleased]
 
+## [1.2.1] - 2026-10-17
+
+### Fixed
+
+- Unknown top-level keys and unknown `meta` keys (ADR-0031 extension keys, e.g. `extra_top`, `meta.vendor_flag`) are no longer lost when a message is republished to a retry topic: the attempt bump now uses `Envelope.withAttempts`, which carries the extras, instead of rebuilding the envelope through the 6-argument constructor. The dead-letter copy already preserved them; regression tests now lock both paths.
+
 ### Changed
 
 - Docs only: the note in the previous release that the Go reference's case-insensitive envelope-key read "is tightened separately" is now closed — Go core 1.14.0 reads envelope keys exactly (case-sensitive, last duplicate wins), so every SDK now decides poison on the same exact-case keys.

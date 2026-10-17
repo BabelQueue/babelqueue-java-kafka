@@ -240,7 +240,7 @@ public final class KafkaConsumer {
     /** {@code bq-attempts} header is authoritative; the body {@code attempts} is the fallback. */
     private static Envelope reconcile(Envelope envelope, ConsumerRecord<byte[], byte[]> record) {
         int attempts = KafkaHeaders.integer(record.headers(), KafkaHeaders.ATTEMPTS, envelope.attempts());
-        return attempts == envelope.attempts() ? envelope : withAttempts(envelope, attempts);
+        return attempts == envelope.attempts() ? envelope : envelope.withAttempts(attempts);
     }
 
     // -- routing / failure paths ------------------------------------------------------------
@@ -291,7 +291,7 @@ public final class KafkaConsumer {
             throw new BabelQueueException("Kafka retry/release requires retry topics; none are configured.");
         }
         RetryTopics.Tier tier = retryTopics.tierForAttempt(envelope.attempts());
-        Envelope bumped = withAttempts(envelope, envelope.attempts() + 1);
+        Envelope bumped = envelope.withAttempts(envelope.attempts() + 1);
         List<Header> headers = KafkaHeaders.of(bumped);
         headers.add(KafkaHeaders.header(KafkaHeaders.DELAY, Long.toString(tier.delay().toMillis())));
         headers.add(KafkaHeaders.header(KafkaHeaders.ORIGINAL_TOPIC, originalTopic(record)));
@@ -442,10 +442,6 @@ public final class KafkaConsumer {
 
     private static String value(ConsumerRecord<byte[], byte[]> record) {
         return record.value() == null ? "" : new String(record.value(), StandardCharsets.UTF_8);
-    }
-
-    private static Envelope withAttempts(Envelope e, int attempts) {
-        return new Envelope(e.job(), e.traceId(), e.data(), e.meta(), attempts, e.deadLetter());
     }
 
     private void requireProducer() {
