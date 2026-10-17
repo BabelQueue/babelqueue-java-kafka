@@ -14,10 +14,12 @@ The envelope wire format is versioned separately by `meta.schema_version`
 ### Fixed
 
 - Unknown top-level keys and unknown `meta` keys (ADR-0031 extension keys, e.g. `extra_top`, `meta.vendor_flag`) are no longer lost when a message is republished to a retry topic: the attempt bump now uses `Envelope.withAttempts`, which carries the extras, instead of rebuilding the envelope through the 6-argument constructor. The dead-letter copy already preserved them; regression tests now lock both paths.
+- `KafkaRedriveTransport` no longer treats a job made only of Unicode whitespace (e.g. U+2003) as blank when deciding whether to project the `bq-*` headers: blank is the closed ASCII set (space, tab, LF, VT, FF, CR) of ADR-0031 (c), so it matches the other SDKs. The check is local to the transport, so it does not depend on the resolved core version.
 
 ### Changed
 
 - Docs only: the note in the previous release that the Go reference's case-insensitive envelope-key read "is tightened separately" is now closed — Go core 1.14.0 reads envelope keys exactly (case-sensitive, last duplicate wins), so every SDK now decides poison on the same exact-case keys.
+- Known limitation: this release resolves `babelqueue-core` 1.10.0 transitively, which predates the ADR-0031 decode behaviour (`job` + `urn` warning, closed ASCII blank set, encode-time extension-key rejection). Add `babelqueue-core` >= 1.11.0 as a direct dependency to get it; the pin will be raised in the next PATCH release.
 
 ## [1.2.0] - 2026-10-12
 

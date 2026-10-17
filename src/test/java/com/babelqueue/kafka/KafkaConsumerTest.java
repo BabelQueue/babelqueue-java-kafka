@@ -170,6 +170,38 @@ class KafkaConsumerTest {
         assertEquals(true, bumped.meta().extras().get("vendor_flag"));
     }
 
+    /** Body says attempts=0 but the {@code bq-attempts} header says 1: the header wins and the extras survive the re-encode. */
+    @Test
+    void headerBodyAttemptsMismatchReconcilePreservesUnknownKeysOnRepublish() {
+        ConsumerRecord<byte[], byte[]> rec = recordFor(envelopeWithExtras(0), 10);
+        rec.headers().remove(KafkaHeaders.ATTEMPTS);
+        KafkaHeaders.of(envelopeWithExtras(1)).stream()
+            .filter(h -> h.key().equals(KafkaHeaders.ATTEMPTS))
+            .forEach(rec.headers()::add);
+        MockProducer<byte[], byte[]> producer = producer();
+        Envelope[] seen = new Envelope[1];
+
+        KafkaConsumer.builder(consumerWith(rec))
+            .producer(producer).retryTopics(topology()).maxTries(3)
+            .handler(URN, (env, r) -> {
+                seen[0] = env;
+                throw new IllegalStateException("boom");
+            })
+            .build()
+            .poll();
+
+        assertEquals(1, seen[0].attempts(), "the header value is authoritative");
+        assertEquals(1L, seen[0].extras().get("extra_top"), "the reconciled envelope keeps top-level extras");
+        assertEquals(true, seen[0].meta().extras().get("vendor_flag"), "the reconciled envelope keeps meta extras");
+
+        ProducerRecord<byte[], byte[]> retry = producer.history().get(0);
+        assertEquals("orders.retry.2", retry.topic());
+        Envelope bumped = EnvelopeCodec.decode(new String(retry.value(), StandardCharsets.UTF_8));
+        assertEquals(2, bumped.attempts());
+        assertEquals(1L, bumped.extras().get("extra_top"));
+        assertEquals(true, bumped.meta().extras().get("vendor_flag"));
+    }
+
     @Test
     void deadLetterPreservesUnknownKeysAndCarriesReasonAndOriginalQueue() {
         MockProducer<byte[], byte[]> producer = producer();

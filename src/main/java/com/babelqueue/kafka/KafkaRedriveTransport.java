@@ -176,13 +176,31 @@ public final class KafkaRedriveTransport
         // EnvelopeCodec.decode never throws: a body that is not an envelope yields one with no job, which is
         // published without header projection and with a fresh timestamp.
         Envelope envelope = EnvelopeCodec.decode(body);
-        if (envelope.job() != null && !envelope.job().isBlank()) {
+        if (!isBlankAscii(envelope.job())) {
             headers = KafkaHeaders.of(envelope);
             if (envelope.meta() != null) {
                 timestamp = envelope.meta().createdAt();
             }
         }
         producer.send(new ProducerRecord<>(topic, null, timestamp, key, value, headers)).get();
+    }
+
+    /**
+     * Whether {@code value} is null, empty or only the closed ASCII whitespace set (space, tab, LF, VT, FF, CR)
+     * — the cross-SDK "blank job" of ADR-0031 (c). Deliberately not {@link String#isBlank()}: Unicode spaces
+     * such as U+2003 are not blank. Kept local so it does not depend on the resolved core version.
+     */
+    static boolean isBlankAscii(String value) {
+        if (value == null) {
+            return true;
+        }
+        for (int i = 0; i < value.length(); i++) {
+            char c = value.charAt(i);
+            if (c != ' ' && c != '\t' && c != '\n' && c != 0x0B && c != '\f' && c != '\r') {
+                return false;
+            }
+        }
+        return true;
     }
 
     /** UTF-8 decode that reports malformed input: {@code null} for a null or invalid value. */

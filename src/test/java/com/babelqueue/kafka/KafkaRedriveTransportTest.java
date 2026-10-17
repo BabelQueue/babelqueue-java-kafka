@@ -2,6 +2,7 @@ package com.babelqueue.kafka;
 
 import static org.junit.jupiter.api.Assertions.assertArrayEquals;
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.mockito.ArgumentMatchers.any;
@@ -485,5 +486,36 @@ class KafkaRedriveTransportTest {
         Consumer<byte[], byte[]> consumer = mock(Consumer.class);
         when(consumer.poll(any(java.time.Duration.class))).thenReturn(ConsumerRecords.empty());
         assertNull(new KafkaRedriveTransport(consumer, producer()).pop("orders.dlq"));
+    }
+
+    /** ADR-0031 (c): blank is the closed ASCII set (space, tab, LF, VT, FF, CR), never Unicode whitespace. */
+    @Test
+    void blankJobIsTheClosedAsciiSetOnly() {
+        assertTrue(KafkaRedriveTransport.isBlankAscii(null));
+        assertTrue(KafkaRedriveTransport.isBlankAscii(""));
+        assertTrue(KafkaRedriveTransport.isBlankAscii(" \t\n\u000B\f\r"));
+        assertFalse(KafkaRedriveTransport.isBlankAscii("\u2003"), "U+2003 is not ASCII blank");
+        assertFalse(KafkaRedriveTransport.isBlankAscii(" \u00A0 "), "NBSP is not ASCII blank");
+        assertFalse(KafkaRedriveTransport.isBlankAscii("urn:babel:orders:created"));
+    }
+
+    /** A job of only Unicode whitespace is not blank, so its record is published with the header projection. */
+    @Test
+    void publishProjectsHeadersForUnicodeWhitespaceJobButNotForAsciiBlankJob() throws Exception {
+        MockProducer<byte[], byte[]> producer = producer();
+        KafkaRedriveTransport transport = new KafkaRedriveTransport(consumerWith(dlqRecord(KEYED, dlqValue())), producer);
+        String envelope = "{\"job\":\"%s\",\"data\":{},\"meta\":{\"queue\":\"orders\",\"id\":\"m-1\","
+            + "\"lang\":\"java\",\"schema_version\":1,\"created_at\":7},\"attempts\":0}";
+
+        transport.publish("orders", envelope.formatted("\\u2003"));
+        transport.publish("orders", envelope.formatted(" \\t"));
+
+        assertEquals(2, producer.history().size());
+        assertEquals(
+            "\u2003", KafkaHeaders.string(producer.history().get(0).headers(), KafkaHeaders.JOB),
+            "Unicode-whitespace job is not blank: headers are projected");
+        assertNull(
+            KafkaHeaders.string(producer.history().get(1).headers(), KafkaHeaders.JOB),
+            "ASCII-blank job is blank: no header projection");
     }
 }
