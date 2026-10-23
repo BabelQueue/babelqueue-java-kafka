@@ -94,10 +94,30 @@ Any other value that is not exactly `1` (no trimming — `"2"`, `"x"`, `" 1"`) �
 decoded and the handler is not called: `onError` is notified with a `null` envelope, the raw record
 is forwarded to `<topic>.dlq` (if configured) and the offset is committed.
 
-> The retry/DLQ records are produced with `bq-delay` set; re-injecting a retry-topic record
-> into the work topic after its tier delay is done by running a worker on the retry topics —
-> the cooperative, partition-paused delay of §6.4. (A bundled re-injection runtime is a
-> near-term addition.)
+### Re-inject consumer (retry tiers)
+
+Retry records are produced with `bq-delay` set to the tier delay. `KafkaRetryReinjector` puts them
+back on the work topic once the tier has elapsed (§6.4):
+
+```java
+var retryConsumer = new org.apache.kafka.clients.consumer.KafkaConsumer<byte[], byte[]>(cfg); // own group.id
+KafkaRetryReinjector reinjector = KafkaRetryReinjector.builder(retryConsumer, producer, retry).build();
+reinjector.subscribe();            // every <topic>.retry.<n>
+reinjector.run(() -> true);        // wait → forward → commit
+```
+
+- Due time is `record.timestamp + tier_ms`, clamped to `[now, now + tier_ms]`: a record older than its
+  tier is forwarded immediately, and a skewed (future) timestamp never waits more than one tier.
+- The wait is partition `pause`/`resume`; the poll loop is never blocked.
+- Value and key are written to `bq-original-topic` byte-for-byte; the body is not decoded and `attempts` is
+  not touched. `bq-delay` and `bq-original-topic` are dropped, every other header (e.g. `traceparent`) is kept.
+- The offset is committed only after the broker acknowledged the write (at-least-once; the work consumer
+  dedupes on `meta.id`).
+- Opt-in default tier ladder: `RetryTopics.forTopic("orders").recommendedTiers()` = 5 s, 30 s, 5 min, 30 min.
+  The failed attempt `n` goes to `<topic>.retry.<min(attempts_before, tiers - 1) + 1>`.
+
+**Operator note.** Set `message.timestamp.type=LogAppendTime` on the retry topics (SHOULD): the wait is
+measured from the record timestamp, and the broker's append time is immune to producer clock skew.
 
 ## Redrive (DLQ replay)
 

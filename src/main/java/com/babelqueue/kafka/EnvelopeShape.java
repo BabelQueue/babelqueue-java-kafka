@@ -11,7 +11,7 @@ import java.util.Map;
  * is undecodable when it is not exactly one well-formed JSON object (a bare {@code null} is accepted as an empty
  * envelope), or when a typed member has the wrong JSON type:
  * <ul>
- *   <li>{@code job}, {@code trace_id}, {@code meta.id|queue|lang}, {@code dead_letter.reason|error|exception|original_queue|lang}
+ *   <li>{@code trace_id}, {@code meta.id|queue|lang}, {@code dead_letter.reason|error|exception|original_queue|lang}
  *       — a string or {@code null};</li>
  *   <li>{@code meta.schema_version|created_at}, {@code attempts}, {@code dead_letter.failed_at|attempts} — an integer
  *       <b>literal</b> (no fraction, no exponent, no overflow of a signed 64-bit value) or {@code null};</li>
@@ -19,11 +19,12 @@ import java.util.Map;
  *       must be representable as a finite double.</li>
  * </ul>
  * Member names are matched exactly as spelled (case-sensitive, as the contract schema and the core decoder read them;
- * this is the one deliberate difference from Go's {@code encoding/json}) and every occurrence of a duplicated member
- * is checked. Unknown members, a differently-cased name included, are only checked for well-formedness; a non-string {@code urn} alias is
- * ignored. Nothing else is poison — in particular a missing {@code data}, a blank {@code trace_id}, a
- * {@code schema_version} other than 1 or an empty {@code job} is routed like Go routes it (the conformance check is
- * not applied on the consume path).
+ * this is the one deliberate difference from Go's {@code encoding/json}) and every occurrence of a duplicated typed member
+ * is checked (for the identity members the last occurrence wins, as in the core decoder). Unknown members, a differently-cased name included, are only checked for well-formedness; a
+ * non-string {@code job} or {@code urn} is <b>ignored</b>, not a type error (ADR-0032 section 6): whether the body still
+ * carries a usable identity is decided separately by the consumer (the {@code no_identity} verdict). Nothing else is poison — in particular a missing {@code data}, a blank {@code trace_id}, a
+ * {@code schema_version} other than 1 or a blank {@code job} is not a shape violation (the conformance check is not applied on the
+ * consume path; a body with no identity at all is dead-lettered as poison by the consumer).
  */
 final class EnvelopeShape {
 
@@ -46,7 +47,6 @@ final class EnvelopeShape {
         "failed_at", Kind.INTEGER, "original_queue", Kind.STRING, "attempts", Kind.INTEGER, "lang", Kind.STRING);
 
     private static final Map<String, Member> TOP = Map.of(
-        "job", new Member(Kind.STRING, null),
         "trace_id", new Member(Kind.STRING, null),
         "attempts", new Member(Kind.INTEGER, null),
         "data", new Member(Kind.DATA, null),

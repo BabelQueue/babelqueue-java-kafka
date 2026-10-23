@@ -182,6 +182,18 @@ public final class KafkaConsumer {
         Envelope envelope = decoded;
 
         String urn = urn(record, envelope);
+        if (urn.isEmpty()) {
+            // no_identity (ADR-0032 section 6): neither a usable job nor a usable urn alias (nor a bq-job header).
+            // A message that cannot be routed is poison, not an unknown URN: dead-letter it, never call a handler.
+            Throwable cause = new BabelQueueException(
+                "Undecodable BabelQueue body: no job or urn identity (a non-string or blank job and urn).");
+            try {
+                return settle(record, null, () -> deadLetterPoison(record, body, cause),
+                    "dead-letter a record with no identity");
+            } finally {
+                report(cause, null, record);
+            }
+        }
         BabelHandler handler = handlers.get(urn);
         if (handler == null) {
             return onUnknownUrn(record, envelope, urn);
@@ -295,6 +307,13 @@ public final class KafkaConsumer {
         List<Header> headers = KafkaHeaders.of(bumped);
         headers.add(KafkaHeaders.header(KafkaHeaders.DELAY, Long.toString(tier.delay().toMillis())));
         headers.add(KafkaHeaders.header(KafkaHeaders.ORIGINAL_TOPIC, originalTopic(record)));
+        // Carry every non-bq-* header of the failed record (W3C traceparent, ADR-0028) through the retry hop, so the
+        // trace stays one chain across the re-inject consumer (A7); bq-* headers are rebuilt above.
+        for (Header incoming : record.headers()) {
+            if (!incoming.key().startsWith("bq-")) {
+                headers.add(new org.apache.kafka.common.header.internals.RecordHeader(incoming.key(), incoming.value()));
+            }
+        }
         // The retry-topic consumer waits until record.timestamp + tier, so timestamp = re-entry time.
         send(tier.topic(), record.key(), bumped, headers, System.currentTimeMillis());
     }
@@ -411,7 +430,7 @@ public final class KafkaConsumer {
 
     private static String urn(ConsumerRecord<byte[], byte[]> record, Envelope envelope) {
         String header = KafkaHeaders.string(record.headers(), KafkaHeaders.JOB);
-        return header != null ? header : EnvelopeCodec.urn(envelope);
+        return header != null && !header.isBlank() ? header : EnvelopeCodec.urn(envelope);
     }
 
     private static String originalTopic(ConsumerRecord<byte[], byte[]> record) {

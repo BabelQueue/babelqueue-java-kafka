@@ -79,4 +79,37 @@ class RetryTopicsTest {
         RetryTopics rt = RetryTopics.forTopic("orders").dlqTopic("orders-dead").build();
         assertEquals("orders-dead", rt.dlqTopic());
     }
+
+    @Test
+    void recommendedTiersAreTheAdr0034LadderAndOptIn() {
+        assertEquals(
+            List.of(5_000L, 30_000L, 300_000L, 1_800_000L),
+            RetryTopics.RECOMMENDED_TIERS.stream().map(Duration::toMillis).toList());
+
+        // Opt-in: a plain builder has no tiers.
+        assertFalse(RetryTopics.forTopic("orders").build().hasTiers());
+
+        RetryTopics rt = RetryTopics.forTopic("orders").recommendedTiers().build();
+        assertEquals(4, rt.tiers().size());
+        assertEquals("orders.retry.4", rt.tiers().get(3).topic());
+        assertEquals(Duration.ofMinutes(30), rt.tiers().get(3).delay());
+    }
+
+    @Test
+    void attemptsBeforeBeyondTheLadderStayOnTheLastTier() {
+        RetryTopics rt = RetryTopics.forTopic("orders").recommendedTiers().build();
+        // target = retry.<min(attempts_before, n-1) + 1>
+        assertEquals("orders.retry.1", rt.tierForAttempt(0).topic());
+        assertEquals("orders.retry.3", rt.tierForAttempt(2).topic());
+        assertEquals("orders.retry.4", rt.tierForAttempt(3).topic());
+        assertEquals("orders.retry.4", rt.tierForAttempt(4).topic());
+        assertEquals("orders.retry.4", rt.tierForAttempt(1_000).topic());
+    }
+
+    @Test
+    void aRequestedDelayIsNotClampedToTheLastTier() {
+        RetryTopics rt = RetryTopics.forTopic("orders").recommendedTiers().build();
+        assertEquals("orders.retry.2", rt.tierForDelay(Duration.ofSeconds(6)).topic());
+        assertThrows(BabelQueueException.class, () -> rt.tierForDelay(Duration.ofMinutes(31)));
+    }
 }

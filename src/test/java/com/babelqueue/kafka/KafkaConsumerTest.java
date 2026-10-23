@@ -128,6 +128,24 @@ class KafkaConsumerTest {
     }
 
     @Test
+    void attemptsBeforeAtOrBeyondTheTierCountStayOnTheLastTier() {
+        // 2 tiers, attempts_before = 4 (>= n): target is retry.<min(4, n-1) + 1> = retry.2, attempts become 5.
+        MockProducer<byte[], byte[]> producer = producer();
+
+        KafkaConsumer.builder(consumerWith(recordFor(envelope(4), 3)))
+            .producer(producer).retryTopics(topology()).maxTries(10)
+            .handler(URN, (env, r) -> { throw new IllegalStateException("boom"); })
+            .build()
+            .poll();
+
+        ProducerRecord<byte[], byte[]> retry = producer.history().get(0);
+        assertEquals("orders.retry.2", retry.topic());
+        assertEquals("5", KafkaHeaders.string(retry.headers(), KafkaHeaders.ATTEMPTS));
+        assertEquals("60000", KafkaHeaders.string(retry.headers(), KafkaHeaders.DELAY));
+        assertEquals(5, EnvelopeCodec.decode(new String(retry.value(), StandardCharsets.UTF_8)).attempts());
+    }
+
+    @Test
     void terminalFailureGoesToDlqWithDeadLetterBlock() {
         ConsumerRecord<byte[], byte[]> rec = recordFor(envelope(2), 7); // nextAttempt 3 == maxTries
         MockProducer<byte[], byte[]> producer = producer();

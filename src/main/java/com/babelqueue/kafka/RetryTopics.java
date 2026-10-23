@@ -15,6 +15,17 @@ import java.util.List;
  */
 public final class RetryTopics {
 
+    /**
+     * The RECOMMENDED tier ladder (ADR-0034 §6.4): 5 s, 30 s, 5 min, 30 min. It is opt-in — nothing
+     * applies it unless the caller passes it to {@link Builder#recommendedTiers()} (or {@link Builder#tier}
+     * one by one); a topology built without tiers keeps its current behaviour.
+     */
+    public static final List<Duration> RECOMMENDED_TIERS = List.of(
+        Duration.ofMillis(5_000),
+        Duration.ofMillis(30_000),
+        Duration.ofMillis(300_000),
+        Duration.ofMillis(1_800_000));
+
     /** A single delay tier: the {@code <topic>.retry.<n>} topic and the wall-clock delay it holds for. */
     public record Tier(String topic, Duration delay) {}
 
@@ -68,8 +79,11 @@ public final class RetryTopics {
     }
 
     /**
-     * The tier for a retry at {@code attempt} (0-based): attempt 0 → the smallest tier, then up
-     * one tier per attempt, clamped to the largest. Raises if no tiers are configured (§6.5).
+     * The tier for a failed delivery that had {@code attemptsBefore} prior attempts (0-based): the target is
+     * {@code <topic>.retry.<min(attemptsBefore, n-1) + 1>} — attempts 0 → {@code .retry.1}, one tier up per
+     * attempt, staying on the last tier once the ladder is exhausted (ADR-0034 §6.5). This rule is for
+     * failures only; a requested delay uses {@link #tierForDelay(Duration)} instead. Raises if no tiers are
+     * configured.
      */
     public Tier tierForAttempt(int attempt) {
         requireTiers();
@@ -98,6 +112,12 @@ public final class RetryTopics {
         /** Add a delay tier; tiers are numbered {@code .retry.1}, {@code .retry.2}, … by ascending delay. */
         public Builder tier(Duration delay) {
             this.delays.add(delay);
+            return this;
+        }
+
+        /** Add the {@link #RECOMMENDED_TIERS} ladder (opt-in; adds to any tiers already added). */
+        public Builder recommendedTiers() {
+            RECOMMENDED_TIERS.forEach(this::tier);
             return this;
         }
 
