@@ -11,7 +11,7 @@ The envelope wire format is versioned separately by `meta.schema_version`
 
 ### Added
 
-- `KafkaRetryReinjector` (ADR-0034 §6.4, A6/A7): the retry-tier re-inject consumer. It drains every `<topic>.retry.<n>`, waits until `record.timestamp + tier_ms` (clamped to `[now, now + tier_ms]`) by pausing the partition — the poll loop is never blocked — and writes the record back to `bq-original-topic` with the value and key byte-for-byte. No decode/re-encode, `attempts` untouched, undecodable records forwarded as-is; `bq-delay` and `bq-original-topic` are dropped, every other header (`traceparent` included) is kept. The offset is committed only after the broker acknowledged the write.
+- `KafkaRetryReinjector` (broker-bindings §6.4, ADR-0034 §5–§7): the retry-tier re-inject consumer. It drains every `<topic>.retry.<n>`, waits until `record.timestamp + tier_ms` (clamped to `[now, now + tier_ms]`) by pausing the partition — the poll loop is never blocked — and writes the record back to `bq-original-topic` with the value and key byte-for-byte. No decode/re-encode, `attempts` untouched, undecodable records forwarded as-is; `bq-delay` and `bq-original-topic` are dropped, every other header (`traceparent` included) is kept. The offset is committed only after the broker acknowledged the write.
 - `RetryTopics.RECOMMENDED_TIERS` (5 s / 30 s / 5 min / 30 min) and `RetryTopics.Builder.recommendedTiers()` — opt-in; the default stays "no tiers".
 - Conformance `kafka_poison` section (92 cases) is run by `KafkaPoisonConformanceTest`; the hand-copied `poison-trigger-set.json` is gone.
 
