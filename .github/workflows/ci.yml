@@ -17,7 +17,7 @@ jobs:
       matrix:
         java: [ "17", "21" ]
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
 
       - uses: actions/setup-java@v4
         with:
@@ -59,7 +59,7 @@ jobs:
           --health-cmd "/opt/kafka/bin/kafka-broker-api-versions.sh --bootstrap-server localhost:9092"
           --health-interval 10s --health-timeout 10s --health-retries 12 --health-start-period 20s
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
 
       - uses: actions/setup-java@v4
         with:
@@ -81,7 +81,7 @@ jobs:
       # Integrity pin for fetch.sh (sha256 of conformance/fetch.sh at the pinned tag).
       BQ_FETCH_SH_SHA256: 8bb6ba567b288fb0ac71a70fd17041b2503df119e01998d76fdad372570bf849
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
       - name: Verify vendored conformance matches the pinned release asset
         run: |
           curl --fail --silent --show-error --location --output "$RUNNER_TEMP/fetch.sh" \
