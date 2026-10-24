@@ -9,6 +9,8 @@ The envelope wire format is versioned separately by `meta.schema_version`
 
 ## [Unreleased]
 
+## [1.3.0] - 2026-10-24
+
 ### Added
 
 - `KafkaRetryReinjector` (broker-bindings §6.4, ADR-0034 §5–§7): the retry-tier re-inject consumer. It drains every `<topic>.retry.<n>`, waits until `record.timestamp + tier_ms` (clamped to `[now, now + tier_ms]`) by pausing the partition — the poll loop is never blocked — and writes the record back to `bq-original-topic` with the value and key byte-for-byte. No decode/re-encode, `attempts` untouched, undecodable records forwarded as-is; `bq-delay` and `bq-original-topic` are dropped, every other header (`traceparent` included) is kept. The offset is committed only after the broker acknowledged the write.
