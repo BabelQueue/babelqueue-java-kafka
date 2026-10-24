@@ -9,6 +9,7 @@ import com.babelqueue.UnknownUrnException;
 import com.babelqueue.UnknownUrnStrategy;
 import java.nio.charset.StandardCharsets;
 import java.time.Duration;
+import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.HashSet;
 import java.util.LinkedHashMap;
@@ -44,9 +45,10 @@ import org.apache.kafka.common.header.Header;
  * <p>An undecodable (poison) body is exactly what Go's typed {@code Decode} rejects (see {@link EnvelopeShape}): not
  * one well-formed JSON object (a bare {@code null} is fine), or a typed envelope member of the wrong JSON type — e.g.
  * {@code meta.id: 5}, {@code meta.created_at: "2026"}, a fractional {@code attempts}, {@code dead_letter.attempts: "3"}.
- * It is dead-lettered like Go does (§6.5): a body that is a JSON object keeps its keys, anything else is wrapped as
- * {@code {"raw": <body>}}, and a {@code dead_letter} block with reason {@code poison} is attached (the record key is
- * preserved). A typed-valid envelope is <b>never</b> poison, even when it is not conformant ({@code data} missing, blank
+ * It is dead-lettered per ADR-0035 (§6.5): a body that is a strict JSON object is spliced (its own members kept
+ * verbatim), anything else is wrapped as {@code {"raw": <string>}} — plain text when valid UTF-8, otherwise base64 with
+ * {@code "raw_encoding": "base64"} — and a {@code dead_letter} block with reason {@code poison} is attached (the record
+ * key is preserved). A typed-valid envelope is <b>never</b> poison, even when it is not conformant ({@code data} missing, blank
  * {@code trace_id}, another body {@code schema_version}, empty {@code job}): like Go's {@code App}, the consume path does
  * not call {@link EnvelopeCodec#accepts} and routes it by URN. The §6.7 version-gate rejection below still forwards the
  * record raw.
@@ -173,7 +175,7 @@ public final class KafkaConsumer {
             // onError can never bypass the DLQ write / commit.
             Throwable cause = undecodable;
             try {
-                return settle(record, null, () -> deadLetterPoison(record, body, cause),
+                return settle(record, null, () -> deadLetterPoison(record, cause),
                     "dead-letter an undecodable record");
             } finally {
                 report(cause, null, record);
@@ -188,7 +190,7 @@ public final class KafkaConsumer {
             Throwable cause = new BabelQueueException(
                 "Undecodable BabelQueue body: no job or urn identity (a non-string or blank job and urn).");
             try {
-                return settle(record, null, () -> deadLetterPoison(record, body, cause),
+                return settle(record, null, () -> deadLetterPoison(record, cause),
                     "dead-letter a record with no identity");
             } finally {
                 report(cause, null, record);
@@ -349,37 +351,36 @@ public final class KafkaConsumer {
     }
 
     /**
-     * Dead-letter an undecodable (poison) body (§6.5), mirroring the Go reference: a body that is a single JSON
-     * object keeps its keys and values, anything else is carried as the string value of {@code raw} (a body that is
-     * not valid UTF-8 is stored with U+FFFD substitutions), and a {@code dead_letter} block with reason
-     * {@code poison} is attached. The record key is carried unchanged and the write is awaited, so the caller never
-     * commits past a failed write. No DLQ configured → commit-and-drop, as for every DLQ path.
+     * Dead-letter an undecodable (poison) body (§6.5, ADR-0035): a body that is a strict JSON object is spliced (its
+     * members kept verbatim, no value re-encoded), anything else is carried as {@code raw} (plain text when valid
+     * UTF-8, otherwise base64 plus {@code raw_encoding: "base64"}; never U+FFFD substitution), and a
+     * {@code dead_letter} block with reason {@code poison} is attached. The record key is carried unchanged and the
+     * write is awaited, so the caller never commits past a failed write. No DLQ configured → commit-and-drop, as for
+     * every DLQ path.
      */
-    private void deadLetterPoison(ConsumerRecord<byte[], byte[]> record, String body, Throwable cause)
+    private void deadLetterPoison(ConsumerRecord<byte[], byte[]> record, Throwable cause)
         throws Exception {
         String dlq = retryTopics == null ? null : retryTopics.dlqTopic();
         if (dlq == null) {
             return;
         }
         requireProducer();
-        String json;
+        byte[] body = record.value() == null ? new byte[0] : record.value();
+        String json = PoisonRecord.build(body, JsonValues.encode(poisonBlock(record, cause)));
+        List<Header> headers;
         try {
-            json = JsonValues.encode(withPoisonBlock(poisonRecord(body), record, cause));
-        } catch (BabelQueueException | StackOverflowError unwritableNumber) {
-            // A number the codec cannot write back (e.g. 1e400 decodes to Infinity) or a structure deeper than its
-            // recursive writer carries: carry the body verbatim as raw.
-            Map<String, Object> raw = new LinkedHashMap<>();
-            raw.put("raw", body);
-            json = JsonValues.encode(withPoisonBlock(raw, record, cause));
+            headers = KafkaHeaders.of(EnvelopeCodec.decode(json, warning -> { }));
+        } catch (RuntimeException | StackOverflowError undecodableRecord) {
+            // A spliced body keeps values the core codec may not carry (1e400, nesting beyond its parser): the
+            // record is still written verbatim, only the envelope-derived headers are skipped.
+            headers = new ArrayList<>();
         }
-        List<Header> headers = KafkaHeaders.of(EnvelopeCodec.decode(json, warning -> { }));
         headers.add(KafkaHeaders.header(KafkaHeaders.ORIGINAL_TOPIC, originalTopic(record)));
         producer.send(new ProducerRecord<>(dlq, null, System.currentTimeMillis(), record.key(),
             json.getBytes(StandardCharsets.UTF_8), headers)).get();
     }
 
-    private static Map<String, Object> withPoisonBlock(Map<String, Object> wrapped,
-                                                       ConsumerRecord<byte[], byte[]> record, Throwable cause) {
+    private static Map<String, Object> poisonBlock(ConsumerRecord<byte[], byte[]> record, Throwable cause) {
         Map<String, Object> deadLetter = new LinkedHashMap<>();
         deadLetter.put("reason", "poison");
         deadLetter.put("error", cause.getMessage());
@@ -388,25 +389,7 @@ public final class KafkaConsumer {
         deadLetter.put("original_queue", originalTopic(record));
         deadLetter.put("attempts", Math.max(KafkaHeaders.integer(record.headers(), KafkaHeaders.ATTEMPTS, 0), 0));
         deadLetter.put("lang", EnvelopeCodec.SOURCE_LANG);
-        wrapped.put("dead_letter", deadLetter);
-        return wrapped;
-    }
-
-    /** The body's own keys when it is exactly one JSON object, else {@code {"raw": body}}. */
-    private static Map<String, Object> poisonRecord(String body) {
-        Map<String, Object> record = new LinkedHashMap<>();
-        try {
-            if (JsonValues.decode(body) instanceof Map<?, ?> object) {
-                for (Map.Entry<?, ?> entry : object.entrySet()) {
-                    record.put(String.valueOf(entry.getKey()), entry.getValue());
-                }
-                return record;
-            }
-        } catch (RuntimeException | StackOverflowError notJson) {
-            // fall through to the raw wrapper (a body nested deeper than the recursive parser carries included)
-        }
-        record.put("raw", body);
-        return record;
+        return deadLetter;
     }
 
     /**

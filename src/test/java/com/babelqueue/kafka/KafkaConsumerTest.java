@@ -1,5 +1,6 @@
 package com.babelqueue.kafka;
 
+import static org.junit.jupiter.api.Assertions.assertArrayEquals;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertInstanceOf;
 import static org.junit.jupiter.api.Assertions.assertNull;
@@ -363,12 +364,49 @@ class KafkaConsumerTest {
     }
 
     @Test
-    void poisonBodyThatIsNotUtf8IsStoredWithReplacementCharacters() {
+    void poisonBodyThatIsNotUtf8IsStoredAsBase64() {
+        // ADR-0035: the exact bytes survive as padded standard base64 plus raw_encoding; never U+FFFD substitution.
         byte[] bytes = {'a', (byte) 0xFF, 'b'};
         MockProducer<byte[], byte[]> producer = producer();
         KafkaConsumer.builder(consumerWith(rawRecord(bytes, 4)))
             .producer(producer).retryTopics(topology()).build().poll();
-        assertEquals("a\uFFFDb", dlqBody(producer.history().get(0)).get("raw"));
+        Map<String, Object> body = dlqBody(producer.history().get(0));
+        assertEquals(java.util.Base64.getEncoder().encodeToString(bytes), body.get("raw"));
+        assertEquals("base64", body.get("raw_encoding"));
+        assertEquals("poison", deadLetterOf(body).get("reason"));
+        assertArrayEquals(bytes, java.util.Base64.getDecoder().decode((String) body.get("raw")));
+    }
+
+    @Test
+    void poisonBodyThatIsValidUtf8OmitsRawEncoding() {
+        MockProducer<byte[], byte[]> producer = producer();
+        KafkaConsumer.builder(consumerWith(rawRecord("caf\u00e9 not json".getBytes(StandardCharsets.UTF_8), 4)))
+            .producer(producer).retryTopics(topology()).build().poll();
+        Map<String, Object> body = dlqBody(producer.history().get(0));
+        assertEquals("caf\u00e9 not json", body.get("raw"));
+        assertTrue(!body.containsKey("raw_encoding"));
+    }
+
+    @Test
+    void poisonBodyThatAlreadyCarriesADeadLetterKeyIsWrapped() {
+        String json = "{\"job\":\"x\",\"data\":[1],\"dead_letter\":{\"reason\":\"old\"}}";
+        MockProducer<byte[], byte[]> producer = producer();
+        KafkaConsumer.builder(consumerWith(rawRecord(json.getBytes(StandardCharsets.UTF_8), 4)))
+            .producer(producer).retryTopics(topology()).build().poll();
+        Map<String, Object> body = dlqBody(producer.history().get(0));
+        assertEquals(json, body.get("raw"));
+        assertEquals("poison", deadLetterOf(body).get("reason"));
+    }
+
+    @Test
+    void poisonObjectBodySplicesTheDeadLetterAfterItsOwnMembers() {
+        // Surrounding whitespace is trimmed; the members stay in order and verbatim.
+        String json = " \n{\"job\":\"x\",\"data\":[1], \"k\" : 2 }\n ";
+        MockProducer<byte[], byte[]> producer = producer();
+        KafkaConsumer.builder(consumerWith(rawRecord(json.getBytes(StandardCharsets.UTF_8), 4)))
+            .producer(producer).retryTopics(topology()).build().poll();
+        String record = new String(producer.history().get(0).value(), StandardCharsets.UTF_8);
+        assertTrue(record.startsWith("{\"job\":\"x\",\"data\":[1], \"k\" : 2 ,\"dead_letter\":{"), record);
     }
 
     @Test
@@ -382,16 +420,15 @@ class KafkaConsumerTest {
     }
 
     @Test
-    void poisonBodyWithANumberTheCodecCannotWriteBackFallsBackToRaw() {
-        // 1e400 decodes to Infinity, which cannot be written back as JSON: the body is carried verbatim as `raw`
-        // instead of producing an invalid (or failing) DLQ record.
+    void poisonBodyWithANumberTheCodecCannotCarryIsSplicedVerbatim() {
+        // 1e400 cannot be re-encoded by the codec, so the writer splices at byte level and keeps the literal.
         String json = "{\"job\":\"x\",\"data\":[1],\"big\":1e400}";
         MockProducer<byte[], byte[]> producer = producer();
         KafkaConsumer.builder(consumerWith(rawRecord(json.getBytes(StandardCharsets.UTF_8), 4)))
             .producer(producer).retryTopics(topology()).build().poll();
-        Map<String, Object> body = dlqBody(producer.history().get(0));
-        assertEquals(json, body.get("raw"));
-        assertEquals("poison", deadLetterOf(body).get("reason"));
+        String record = new String(producer.history().get(0).value(), StandardCharsets.UTF_8);
+        assertTrue(record.startsWith(json.substring(0, json.length() - 1) + ",\"dead_letter\":{"), record);
+        assertTrue(record.contains("\"reason\":\"poison\""));
     }
 
     @Test

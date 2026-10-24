@@ -17,8 +17,10 @@ The envelope wire format is versioned separately by `meta.schema_version`
 
 ### Changed
 
+- Local `PoisonRecord` copy: the `dead_letter` argument is now validated as a single JSON object and rejected otherwise. Kept in sync with `babelqueue-core`.
 - Retry republish carries the failed record's non-`bq-*` headers (W3C `traceparent`) onto the retry tier so the trace stays one chain through the re-inject hop.
 - A record with no usable identity (no `job`/`urn` in the body and no `bq-job` header) is dead-lettered as poison; a non-string `job` is no longer a shape violation of its own (the identity check decides, per the conformance `kafka_poison` section).
+- **Poison DLQ record shape follows ADR-0035:** a strict JSON object body is spliced byte for byte with a `dead_letter` member (no value is re-encoded, so `1e400`, big integers and repeated member names survive); anything else is wrapped as `{"raw": ..., "raw_encoding"?: "base64", "dead_letter": ...}`. A body that is not valid UTF-8 is carried as standard base64 plus `raw_encoding: "base64"` instead of with U+FFFD substitution, and an object that already has a top-level `dead_letter` is wrapped. The new `poison_dlq` conformance section is run by `PoisonDlqConformanceTest`.
 - Vendored conformance bumped to v1.6.0; CI pins `BQ_CONFORMANCE_VERSION=1.6.0` and verifies `fetch.sh` against `BQ_FETCH_SH_SHA256`.
 
 ## [1.2.1] - 2026-10-17
