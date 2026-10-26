@@ -6,6 +6,7 @@ import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
+import com.babelqueue.PoisonRecord;
 import java.io.IOException;
 import java.io.InputStream;
 import java.nio.charset.StandardCharsets;
