@@ -4,7 +4,7 @@ import com.babelqueue.BabelQueueException;
 import com.babelqueue.DeadLetters;
 import com.babelqueue.Envelope;
 import com.babelqueue.EnvelopeCodec;
-import com.babelqueue.JsonValues;
+import com.babelqueue.PoisonRecord;
 import com.babelqueue.UnknownUrnException;
 import com.babelqueue.UnknownUrnStrategy;
 import java.nio.charset.StandardCharsets;
@@ -12,7 +12,6 @@ import java.time.Duration;
 import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.HashSet;
-import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Objects;
@@ -366,7 +365,9 @@ public final class KafkaConsumer {
         }
         requireProducer();
         byte[] body = record.value() == null ? new byte[0] : record.value();
-        String json = PoisonRecord.build(body, JsonValues.encode(poisonBlock(record, cause)));
+        String json = PoisonRecord.build(body, originalTopic(record),
+            Math.max(KafkaHeaders.integer(record.headers(), KafkaHeaders.ATTEMPTS, 0), 0),
+            cause.getMessage(), cause.getClass().getName());
         List<Header> headers;
         try {
             headers = KafkaHeaders.of(EnvelopeCodec.decode(json, warning -> { }));
@@ -378,18 +379,6 @@ public final class KafkaConsumer {
         headers.add(KafkaHeaders.header(KafkaHeaders.ORIGINAL_TOPIC, originalTopic(record)));
         producer.send(new ProducerRecord<>(dlq, null, System.currentTimeMillis(), record.key(),
             json.getBytes(StandardCharsets.UTF_8), headers)).get();
-    }
-
-    private static Map<String, Object> poisonBlock(ConsumerRecord<byte[], byte[]> record, Throwable cause) {
-        Map<String, Object> deadLetter = new LinkedHashMap<>();
-        deadLetter.put("reason", "poison");
-        deadLetter.put("error", cause.getMessage());
-        deadLetter.put("exception", cause.getClass().getName());
-        deadLetter.put("failed_at", System.currentTimeMillis());
-        deadLetter.put("original_queue", originalTopic(record));
-        deadLetter.put("attempts", Math.max(KafkaHeaders.integer(record.headers(), KafkaHeaders.ATTEMPTS, 0), 0));
-        deadLetter.put("lang", EnvelopeCodec.SOURCE_LANG);
-        return deadLetter;
     }
 
     /**
