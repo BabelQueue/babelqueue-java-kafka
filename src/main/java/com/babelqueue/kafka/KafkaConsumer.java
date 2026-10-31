@@ -415,8 +415,8 @@ public final class KafkaConsumer {
         if (deadLetterObserver == null) {
             return;
         }
-        String queue = envelope != null && envelope.meta() != null && envelope.meta().queue() != null
-            && !envelope.meta().queue().isBlank() ? envelope.meta().queue() : originalTopic(record);
+        String queue = envelope != null && envelope.meta() != null
+            && !EnvelopeCodec.isBlankAscii(envelope.meta().queue()) ? envelope.meta().queue() : originalTopic(record);
         DeadLetterObserver.notifySafely(deadLetterObserver, new DeadLetterEvent(queue, dlq, reason));
     }
 
