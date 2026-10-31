@@ -1,6 +1,8 @@
 package com.babelqueue.kafka;
 
 import com.babelqueue.BabelQueueException;
+import com.babelqueue.DeadLetterEvent;
+import com.babelqueue.DeadLetterObserver;
 import com.babelqueue.DeadLetters;
 import com.babelqueue.Envelope;
 import com.babelqueue.EnvelopeCodec;
@@ -62,6 +64,11 @@ import org.apache.kafka.common.header.Header;
  * the failure is reported to {@code onError}; the record is redelivered on the next poll and rejected again,
  * never lost and never handled. An absent or blank header changes nothing.
  *
+ * <p>An optional {@link DeadLetterObserver} (ADR-0039 section 5.1) is called once per record the SDK itself
+ * wrote to the DLQ topic — exhausted retry, unmapped URN under {@code dead_letter}, poison body, raw version-gated
+ * body — after the broker confirmed the write. It is not called when the write fails, when a record is only
+ * republished to a retry tier, or when no DLQ is configured; an observer failure never changes the settle outcome.
+ *
  * <p>Not thread-safe — a Kafka consumer is single-threaded by design; run one per thread.
  */
 public final class KafkaConsumer {
@@ -83,6 +90,7 @@ public final class KafkaConsumer {
     private final String unknownUrn;
     private final ErrorHandler onError;
     private final Duration pollTimeout;
+    private final DeadLetterObserver deadLetterObserver;
 
     private KafkaConsumer(Builder builder) {
         this.consumer = builder.consumer;
@@ -93,6 +101,7 @@ public final class KafkaConsumer {
         this.unknownUrn = builder.unknownUrn;
         this.onError = builder.onError;
         this.pollTimeout = builder.pollTimeout;
+        this.deadLetterObserver = builder.deadLetterObserver;
     }
 
     public static Builder builder(Consumer<byte[], byte[]> consumer) {
@@ -332,6 +341,7 @@ public final class KafkaConsumer {
         List<Header> headers = KafkaHeaders.of(annotated);
         headers.add(KafkaHeaders.header(KafkaHeaders.ORIGINAL_TOPIC, originalTopic(record)));
         send(dlq, record.key(), annotated, headers, System.currentTimeMillis());
+        notifyDeadLetter(record, envelope, dlq, reason);
     }
 
     /**
@@ -347,6 +357,7 @@ public final class KafkaConsumer {
         requireProducer();
         producer.send(new ProducerRecord<>(dlq, null, System.currentTimeMillis(), record.key(),
             record.value(), record.headers())).get();
+        notifyDeadLetter(record, null, dlq, "");
     }
 
     /**
@@ -379,6 +390,7 @@ public final class KafkaConsumer {
         headers.add(KafkaHeaders.header(KafkaHeaders.ORIGINAL_TOPIC, originalTopic(record)));
         producer.send(new ProducerRecord<>(dlq, null, System.currentTimeMillis(), record.key(),
             json.getBytes(StandardCharsets.UTF_8), headers)).get();
+        notifyDeadLetter(record, null, dlq, "poison");
     }
 
     /**
@@ -394,6 +406,19 @@ public final class KafkaConsumer {
     }
 
     // -- helpers ----------------------------------------------------------------------------
+
+    /**
+     * Reports a DLQ write the broker just confirmed (ADR-0039 section 5.1). {@code queue} is {@code meta.queue} when the
+     * envelope carries one, else the topic the record was consumed from. Never throws on an observer failure.
+     */
+    private void notifyDeadLetter(ConsumerRecord<byte[], byte[]> record, Envelope envelope, String dlq, String reason) {
+        if (deadLetterObserver == null) {
+            return;
+        }
+        String queue = envelope != null && envelope.meta() != null && envelope.meta().queue() != null
+            && !envelope.meta().queue().isBlank() ? envelope.meta().queue() : originalTopic(record);
+        DeadLetterObserver.notifySafely(deadLetterObserver, new DeadLetterEvent(queue, dlq, reason));
+    }
 
     private void commit(ConsumerRecord<byte[], byte[]> record) {
         TopicPartition tp = new TopicPartition(record.topic(), record.partition());
@@ -466,6 +491,7 @@ public final class KafkaConsumer {
         private String unknownUrn = UnknownUrnStrategy.FAIL;
         private ErrorHandler onError;
         private Duration pollTimeout = Duration.ofMillis(1000);
+        private DeadLetterObserver deadLetterObserver;
 
         private Builder(Consumer<byte[], byte[]> consumer) {
             this.consumer = Objects.requireNonNull(consumer, "consumer");
@@ -513,6 +539,15 @@ public final class KafkaConsumer {
 
         public Builder pollTimeout(Duration pollTimeout) {
             this.pollTimeout = pollTimeout;
+            return this;
+        }
+
+        /**
+         * Optional observer called once per record written to the DLQ topic, after the write is confirmed
+         * (ADR-0039 section 5.1). Failures of the observer are logged and never change the settle outcome.
+         */
+        public Builder deadLetterObserver(DeadLetterObserver deadLetterObserver) {
+            this.deadLetterObserver = deadLetterObserver;
             return this;
         }
 
