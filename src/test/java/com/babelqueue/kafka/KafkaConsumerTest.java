@@ -1009,4 +1009,26 @@ class KafkaConsumerTest {
         assertThrows(UnknownUrnException.class, worker::poll);
         verify(consumer, never()).commitSync(any(Map.class));
     }
+
+    @Test
+    void publishedTraceparentReachesTheHandlerViaHeadersOfAndNotTheBody() {
+        String traceparent = "00-0af7651916cd43dd8448eb211c80319c-b7ad6b7169203331-01";
+        MockProducer<byte[], byte[]> producer = producer();
+        Envelope env = EnvelopeCodec.make(URN, Map.of("order_id", 7), "orders", "trace-1");
+        KafkaPublisher.create(producer, "orders").publishWithHeaders(env, Map.of("traceparent", traceparent));
+        ProducerRecord<byte[], byte[]> sent = producer.history().get(0);
+        ConsumerRecord<byte[], byte[]> delivered = new ConsumerRecord<>("orders", 0, 3, sent.timestamp(),
+            TimestampType.CREATE_TIME, -1, sent.value().length, null, sent.value(), sent.headers(), Optional.empty());
+        Map<String, String>[] seen = new Map[]{null};
+
+        KafkaConsumer.builder(consumerWith(delivered))
+            .handler(URN, (e, r) -> seen[0] = BabelHandler.headersOf(r))
+            .build()
+            .poll();
+
+        assertEquals(traceparent, seen[0].get("traceparent"));
+        assertEquals("trace-1", seen[0].get("bq-trace-id"));
+        assertTrue(!new String(delivered.value(), StandardCharsets.UTF_8).contains("traceparent"));
+        assertTrue(BabelHandler.headersOf(null).isEmpty());
+    }
 }

@@ -23,6 +23,10 @@ import org.apache.kafka.common.header.Header;
  * topology ({@link #create(Producer, RetryTopics)}) and is routed to the matching
  * {@code <topic>.retry.<n>} tier; on a plain publisher a delay raises {@link BabelQueueException}
  * rather than being silently dropped (§6.4).
+ *
+ * <p>Out-of-band transport headers (e.g. the W3C {@code traceparent}, ADR-0028) ride as extra UTF-8
+ * record headers <b>beside</b> the contract {@code bq-} headers — never inside the envelope (GR-1);
+ * see {@link #publishWithHeaders(Envelope, Map)}, the seam for {@code com.babelqueue.otel.HeaderSender}.
  */
 public final class KafkaPublisher {
 
@@ -63,6 +67,17 @@ public final class KafkaPublisher {
      * set); on a plain publisher a positive delay raises {@link BabelQueueException}.
      */
     public String publish(String urn, Map<String, Object> data, String traceId, Duration delay) {
+        return publish(urn, data, traceId, delay, null);
+    }
+
+    /**
+     * Publish as {@link #publish(String, Map, String, Duration)}, additionally carrying the
+     * out-of-band {@code headers} (e.g. {@code traceparent}) as record headers beside the contract
+     * {@code bq-} headers. A contract header already present always wins a collision; blank keys or
+     * values are skipped; {@code null}/empty {@code headers} is byte-identical to the plain overload.
+     */
+    public String publish(String urn, Map<String, Object> data, String traceId, Duration delay,
+                          Map<String, String> headers) {
         Envelope envelope = EnvelopeCodec.make(urn, data, workTopic, traceId);
         if (delay != null && !delay.isZero() && !delay.isNegative()) {
             if (retryTopics == null) {
@@ -70,14 +85,27 @@ public final class KafkaPublisher {
                     "Kafka has no native delayed delivery; a delay requires retry topics (none configured).");
             }
             RetryTopics.Tier tier = retryTopics.tierForDelay(delay);
-            send(tier.topic(), envelope, delay, workTopic);
+            send(tier.topic(), envelope, delay, workTopic, headers);
         } else {
-            send(workTopic, envelope, null, null);
+            send(workTopic, envelope, null, null, headers);
         }
         return envelope.meta() != null ? envelope.meta().id() : "";
     }
 
-    private void send(String topic, Envelope envelope, Duration delay, String originalTopic) {
+    /**
+     * Publish an already-built {@code envelope} to the work topic together with out-of-band transport
+     * {@code headers} (e.g. a W3C {@code traceparent}, ADR-0028). This is the produce-side seam the
+     * optional {@code com.babelqueue.otel.HeaderSender} wires to:
+     * {@code Tracing.publish(tracer, urn, data, queue, publisher::publishWithHeaders)}. The record
+     * value stays the byte-identical envelope JSON. Returns {@code meta.id}.
+     */
+    public String publishWithHeaders(Envelope envelope, Map<String, String> headers) {
+        send(workTopic, envelope, null, null, headers);
+        return envelope.meta() != null ? envelope.meta().id() : "";
+    }
+
+    private void send(String topic, Envelope envelope, Duration delay, String originalTopic,
+                      Map<String, String> outOfBand) {
         List<Header> headers = KafkaHeaders.of(envelope);
         if (delay != null) {
             headers.add(KafkaHeaders.header(KafkaHeaders.DELAY, Long.toString(delay.toMillis())));
@@ -85,6 +113,7 @@ public final class KafkaPublisher {
         if (originalTopic != null) {
             headers.add(KafkaHeaders.header(KafkaHeaders.ORIGINAL_TOPIC, originalTopic));
         }
+        KafkaHeaders.addOutOfBand(headers, outOfBand);
         byte[] value = EnvelopeCodec.encode(envelope).getBytes(StandardCharsets.UTF_8);
         long timestamp = envelope.meta() != null ? envelope.meta().createdAt() : System.currentTimeMillis();
         producer.send(new ProducerRecord<>(topic, null, timestamp, null, value, headers));

@@ -9,6 +9,11 @@ The envelope wire format is versioned separately by `meta.schema_version`
 
 ## [Unreleased]
 
+### Added
+
+- **W3C `traceparent` out-of-band propagation (ADR-0028).** `KafkaPublisher`: `publishWithHeaders(Envelope, Map<String,String>)` (the produce-side seam for the core's `com.babelqueue.otel.HeaderSender`) and a `publish(..., Map<String,String> headers)` overload carry out-of-band headers (e.g. `traceparent`, `tracestate`) as UTF-8 Kafka record headers beside the contract `bq-` entries. A contract entry always wins a collision; blank keys/values are skipped; with no/empty headers the message is identical to a plain `publish`. The envelope body is untouched (GR-1, `schema_version` stays 1).
+- `BabelHandler.headersOf(ConsumerRecord<byte[], byte[]>)` surfaces the delivered UTF-8 Kafka record headers as a `Map<String,String>` — the `Supplier` source for `Tracing.wrapHandler(tracer, handler, headers)`, so the consumer span becomes a true child of the producer span. No OpenTelemetry dependency is added (the core's OTel API stays optional).
+
 ## [1.3.1] - 2026-10-26
 
 ### Changed
