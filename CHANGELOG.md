@@ -9,6 +9,8 @@ The envelope wire format is versioned separately by `meta.schema_version`
 
 ## [Unreleased]
 
+## [1.4.0] - 2026-11-03
+
 ### Added
 
 - **Dead-letter observer (ADR-0039 section 5.1).** `KafkaConsumer.Builder#deadLetterObserver(DeadLetterObserver)` takes the core's optional `com.babelqueue.DeadLetterObserver` (needs a `babelqueue-core` that ships it). It is called once per record the SDK wrote to the DLQ topic, after the broker confirmed the write: an exhausted retry, an unmapped URN under `dead_letter`, a poison body, and a raw record rejected by the schema-version gate (empty `reason`). `DeadLetterEvent.queue` is `meta.queue` when the envelope carries one, else the topic the record came from. It is not called when the write fails, for a retry-tier republish, or when no DLQ is configured; an observer failure is logged and never changes the settle outcome. Without an observer nothing changes.
