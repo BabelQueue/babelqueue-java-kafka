@@ -13,6 +13,8 @@ import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.when;
 
 import com.babelqueue.BabelQueueException;
+import com.babelqueue.DeadLetterEvent;
+import com.babelqueue.DeadLetterObserver;
 import com.babelqueue.Envelope;
 import com.babelqueue.EnvelopeCodec;
 import com.babelqueue.JsonValues;
@@ -1008,5 +1010,223 @@ class KafkaConsumerTest {
 
         assertThrows(UnknownUrnException.class, worker::poll);
         verify(consumer, never()).commitSync(any(Map.class));
+    }
+
+    @Test
+    void publishedTraceparentReachesTheHandlerViaHeadersOfAndNotTheBody() {
+        String traceparent = "00-0af7651916cd43dd8448eb211c80319c-b7ad6b7169203331-01";
+        MockProducer<byte[], byte[]> producer = producer();
+        Envelope env = EnvelopeCodec.make(URN, Map.of("order_id", 7), "orders", "trace-1");
+        KafkaPublisher.create(producer, "orders").publishWithHeaders(env, Map.of("traceparent", traceparent));
+        ProducerRecord<byte[], byte[]> sent = producer.history().get(0);
+        ConsumerRecord<byte[], byte[]> delivered = new ConsumerRecord<>("orders", 0, 3, sent.timestamp(),
+            TimestampType.CREATE_TIME, -1, sent.value().length, null, sent.value(), sent.headers(), Optional.empty());
+        Map<String, String>[] seen = new Map[]{null};
+
+        KafkaConsumer.builder(consumerWith(delivered))
+            .handler(URN, (e, r) -> seen[0] = BabelHandler.headersOf(r))
+            .build()
+            .poll();
+
+        assertEquals(traceparent, seen[0].get("traceparent"));
+        assertEquals("trace-1", seen[0].get("bq-trace-id"));
+        assertTrue(!new String(delivered.value(), StandardCharsets.UTF_8).contains("traceparent"));
+        assertTrue(BabelHandler.headersOf(null).isEmpty());
+    }
+
+    // ---- ADR-0039 section 5.1 dead-letter observer ----------------------------------------------
+
+    @Test
+    void observerSeesAnExhaustedRetryOnceWithQueueDlqAndReason() {
+        List<DeadLetterEvent> events = new ArrayList<>();
+        MockProducer<byte[], byte[]> producer = producer();
+
+        KafkaConsumer.builder(consumerWith(recordFor(envelope(2), 7)))
+            .producer(producer).retryTopics(topology()).maxTries(3)
+            .handler(URN, (env, r) -> { throw new IllegalStateException("boom"); })
+            .deadLetterObserver(events::add)
+            .build()
+            .poll();
+
+        assertEquals(List.of(new DeadLetterEvent("orders", "orders.dlq", "failed")), events);
+    }
+
+    @Test
+    void observerIsNotCalledForARetryTierRepublish() {
+        List<DeadLetterEvent> events = new ArrayList<>();
+
+        KafkaConsumer.builder(consumerWith(recordFor(envelope(0), 7)))
+            .producer(producer()).retryTopics(topology()).maxTries(3)
+            .handler(URN, (env, r) -> { throw new IllegalStateException("boom"); })
+            .deadLetterObserver(events::add)
+            .build()
+            .poll();
+
+        assertTrue(events.isEmpty());
+    }
+
+    @Test
+    void observerSeesAnUnknownUrnDeadLetter() {
+        List<DeadLetterEvent> events = new ArrayList<>();
+
+        KafkaConsumer.builder(consumerWith(recordFor(envelope(0), 2)))
+            .producer(producer()).retryTopics(topology())
+            .unknownUrn(UnknownUrnStrategy.DEAD_LETTER)
+            .deadLetterObserver(events::add)
+            .build()
+            .poll();
+
+        assertEquals(List.of(new DeadLetterEvent("orders", "orders.dlq", "unknown_urn")), events);
+    }
+
+    @Test
+    void observerSeesAPoisonRecord() {
+        List<DeadLetterEvent> events = new ArrayList<>();
+
+        KafkaConsumer.builder(consumerWith(rawRecord("not-json".getBytes(StandardCharsets.UTF_8), 4)))
+            .producer(producer()).retryTopics(topology())
+            .deadLetterObserver(events::add)
+            .build()
+            .poll();
+
+        assertEquals(List.of(new DeadLetterEvent("orders", "orders.dlq", "poison")), events);
+    }
+
+    @Test
+    void observerSeesAVersionGatedRawBodyWithAnEmptyReason() {
+        List<DeadLetterEvent> events = new ArrayList<>();
+        byte[] body = "not-json".getBytes(StandardCharsets.UTF_8);
+
+        KafkaConsumer.builder(consumerWith(versionedRecord(body, "2", 8)))
+            .producer(producer()).retryTopics(topology())
+            .deadLetterObserver(events::add)
+            .build()
+            .poll();
+
+        assertEquals(1, events.size());
+        assertEquals("orders", events.get(0).queue());
+        assertEquals("orders.dlq", events.get(0).deadLetterQueue());
+        assertEquals("", events.get(0).reason());
+    }
+
+    @Test
+    void observerIsNotCalledWhenTheDlqWriteFails() {
+        List<DeadLetterEvent> events = new ArrayList<>();
+        Consumer<byte[], byte[]> gatedConsumer =
+            consumerWith(versionedRecord("not-json".getBytes(StandardCharsets.UTF_8), "2", 8));
+        Consumer<byte[], byte[]> poisonConsumer =
+            consumerWith(rawRecord("not-json".getBytes(StandardCharsets.UTF_8), 4));
+        Consumer<byte[], byte[]> exhaustedConsumer = consumerWith(recordFor(envelope(2), 7));
+
+        KafkaConsumer.builder(gatedConsumer).producer(failingProducer()).retryTopics(topology())
+            .deadLetterObserver(events::add).build().poll();
+        KafkaConsumer.builder(poisonConsumer).producer(failingProducer()).retryTopics(topology())
+            .deadLetterObserver(events::add).build().poll();
+        KafkaConsumer.builder(exhaustedConsumer).producer(failingProducer()).retryTopics(topology()).maxTries(3)
+            .handler(URN, (env, r) -> { throw new IllegalStateException("boom"); })
+            .deadLetterObserver(events::add).build().poll();
+
+        assertTrue(events.isEmpty());
+        verify(gatedConsumer).seek(TP, 8L);
+        verify(poisonConsumer).seek(TP, 4L);
+        verify(exhaustedConsumer).seek(TP, 7L);
+    }
+
+    @Test
+    void observerIsNotCalledWhenTheDlqIsDisabled() {
+        List<DeadLetterEvent> events = new ArrayList<>();
+        RetryTopics noDlq = RetryTopics.forTopic("orders").tier(Duration.ofSeconds(5)).withoutDlq().build();
+
+        KafkaConsumer.builder(consumerWith(recordFor(envelope(2), 7)))
+            .producer(producer()).retryTopics(noDlq).maxTries(3)
+            .handler(URN, (env, r) -> { throw new IllegalStateException("boom"); })
+            .deadLetterObserver(events::add)
+            .build()
+            .poll();
+        KafkaConsumer.builder(consumerWith(versionedRecord("x".getBytes(StandardCharsets.UTF_8), "2", 8)))
+            .producer(producer()).retryTopics(noDlq)
+            .deadLetterObserver(events::add)
+            .build()
+            .poll();
+
+        assertTrue(events.isEmpty());
+    }
+
+    @Test
+    void aThrowingObserverDoesNotChangeTheSettleOutcome() {
+        DeadLetterObserver boom = event -> { throw new IllegalStateException("observer down"); };
+        DeadLetterObserver fatal = event -> { throw new AssertionError("observer asserts"); };
+
+        for (DeadLetterObserver observer : List.of(boom, fatal)) {
+            Consumer<byte[], byte[]> exhausted = consumerWith(recordFor(envelope(2), 7));
+            MockProducer<byte[], byte[]> producer = producer();
+            KafkaConsumer.builder(exhausted)
+                .producer(producer).retryTopics(topology()).maxTries(3)
+                .handler(URN, (env, r) -> { throw new IllegalStateException("boom"); })
+                .deadLetterObserver(observer)
+                .build()
+                .poll();
+            assertEquals(1, producer.history().size());
+            verify(exhausted).commitSync(Map.of(TP, new OffsetAndMetadata(8)));
+            verify(exhausted, never()).seek(any(), org.mockito.ArgumentMatchers.anyLong());
+
+            Consumer<byte[], byte[]> gated = consumerWith(versionedRecord("x".getBytes(StandardCharsets.UTF_8), "2", 8));
+            KafkaConsumer.builder(gated).producer(producer()).retryTopics(topology())
+                .deadLetterObserver(observer).build().poll();
+            verify(gated).commitSync(Map.of(TP, new OffsetAndMetadata(9)));
+
+            Consumer<byte[], byte[]> poison = consumerWith(rawRecord("not-json".getBytes(StandardCharsets.UTF_8), 4));
+            KafkaConsumer.builder(poison).producer(producer()).retryTopics(topology())
+                .deadLetterObserver(observer).build().poll();
+            verify(poison).commitSync(Map.of(TP, new OffsetAndMetadata(5)));
+        }
+    }
+
+    @Test
+    void eventQueueIsMetaQueueForAnEnvelopeAndTheConsumedTopicForAPoisonRecord() {
+        // meta.queue ("billing") differs from the topic the record was consumed from ("orders").
+        Envelope base = EnvelopeCodec.make(URN, Map.of("order_id", 7), "billing", "trace-1");
+        Envelope billing = new Envelope(base.job(), base.traceId(), base.data(), base.meta(), 2, base.deadLetter());
+        List<DeadLetterEvent> events = new ArrayList<>();
+
+        KafkaConsumer.builder(consumerWith(recordFor(billing, 7)))
+            .producer(producer()).retryTopics(topology()).maxTries(3)
+            .handler(URN, (env, r) -> { throw new IllegalStateException("boom"); })
+            .deadLetterObserver(events::add)
+            .build()
+            .poll();
+        KafkaConsumer.builder(consumerWith(rawRecord("not-json".getBytes(StandardCharsets.UTF_8), 4)))
+            .producer(producer()).retryTopics(topology())
+            .deadLetterObserver(events::add)
+            .build()
+            .poll();
+
+        assertEquals(List.of(
+            new DeadLetterEvent("billing", "orders.dlq", "failed"),
+            new DeadLetterEvent("orders", "orders.dlq", "poison")), events);
+    }
+
+    @Test
+    void eventQueueFallbackTreatsOnlyTheAsciiWhitespaceSetAsBlank() {
+        String json = EnvelopeCodec.encode(EnvelopeCodec.make(URN, Map.of("order_id", 7), "billing", "trace-1"));
+        // meta.queue as JSON text -> the queue the event must report. Only the ASCII whitespace set is blank (ADR-0031):
+        // Unicode spaces and control characters (Character.isWhitespace) are real, non-blank names.
+        String[][] cases = {
+            {" \\t", "orders"}, {"", "orders"}, {"\\u000b\\f\\r", "orders"},
+            {"\\u2003", "\u2003"}, {"\\u00a0", "\u00a0"}, {"\\u001c", "\u001c"}, {"\\u0085", "\u0085"},
+        };
+        for (String[] c : cases) {
+            List<DeadLetterEvent> events = new ArrayList<>();
+
+            KafkaConsumer.builder(consumerWith(rawRecord(json.replace("\"queue\":\"billing\"", "\"queue\":\"" + c[0] + "\"").getBytes(StandardCharsets.UTF_8), 7)))
+                .producer(producer()).retryTopics(topology())
+                .unknownUrn(UnknownUrnStrategy.DEAD_LETTER)
+                .deadLetterObserver(events::add)
+                .build()
+                .poll();
+
+            assertEquals(1, events.size(), c[0]);
+            assertEquals(c[1], events.get(0).queue(), "meta.queue=" + c[0]);
+        }
     }
 }

@@ -1,6 +1,7 @@
 package com.babelqueue.kafka;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertTrue;
 
 import com.babelqueue.Envelope;
 import com.babelqueue.EnvelopeCodec;
@@ -36,5 +37,49 @@ class KafkaHeadersTest {
         assertEquals(3, KafkaHeaders.integer(rh, KafkaHeaders.ATTEMPTS, -1));
         assertEquals(9, KafkaHeaders.integer(rh, "bq-missing", 9));
         assertEquals(0, KafkaHeaders.integer(rh, "bq-bad", 0));
+    }
+
+    @Test
+    void outOfBandHeadersAreAppendedSortedAndNeverClobberContractHeaders() {
+        Envelope env = EnvelopeCodec.make("urn:babel:orders:created", Map.of(), "orders", "trace-1");
+        List<Header> headers = KafkaHeaders.of(env);
+
+        KafkaHeaders.addOutOfBand(headers, Map.of(
+            "traceparent", "00-0af7651916cd43dd8448eb211c80319c-b7ad6b7169203331-01",
+            "tracestate", "a=b",
+            KafkaHeaders.JOB, "urn:evil"));
+
+        RecordHeaders rh = new RecordHeaders(headers);
+        assertEquals("urn:babel:orders:created", KafkaHeaders.string(rh, KafkaHeaders.JOB));
+        assertEquals("00-0af7651916cd43dd8448eb211c80319c-b7ad6b7169203331-01", KafkaHeaders.string(rh, "traceparent"));
+        assertEquals("a=b", KafkaHeaders.string(rh, "tracestate"));
+    }
+
+    @Test
+    void toMapSurfacesUtf8ValuesAndDropsBlanks() {
+        RecordHeaders rh = new RecordHeaders();
+        rh.add(KafkaHeaders.header("traceparent", "00-0af7651916cd43dd8448eb211c80319c-b7ad6b7169203331-01"));
+        rh.add(KafkaHeaders.header("blank", ""));
+
+        Map<String, String> map = KafkaHeaders.toMap(rh);
+
+        assertEquals("00-0af7651916cd43dd8448eb211c80319c-b7ad6b7169203331-01", map.get("traceparent"));
+        assertTrue(!map.containsKey("blank"));
+        assertTrue(KafkaHeaders.toMap(null).isEmpty());
+    }
+
+    @Test
+    void nullValuedHeadersAreSkippedByToMapAndStringAndTheLastValueWins() {
+        RecordHeaders rh = new RecordHeaders();
+        rh.add(new org.apache.kafka.common.header.internals.RecordHeader("x-foreign", (byte[]) null));
+        rh.add(new org.apache.kafka.common.header.internals.RecordHeader(KafkaHeaders.JOB, (byte[]) null));
+        rh.add(KafkaHeaders.header("traceparent", "00-old"));
+        rh.add(KafkaHeaders.header("traceparent", "00-new"));
+
+        Map<String, String> map = KafkaHeaders.toMap(rh);
+
+        assertEquals(Map.of("traceparent", "00-new"), map);
+        assertEquals(null, KafkaHeaders.string(rh, "x-foreign"));
+        assertEquals(null, KafkaHeaders.string(rh, KafkaHeaders.JOB));
     }
 }
